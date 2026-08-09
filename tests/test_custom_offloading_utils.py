@@ -169,7 +169,7 @@ def test_swap_weight_devices(mock_no_cuda, mock_cuda, offloader: Offloader):
 
 
 @patch('library.custom_offloading_utils.Offloader.swap_weight_devices')
-def test_submit_move_blocks(mock_swap, offloader):
+def test_internal_submit_move_blocks(mock_swap, offloader):
     blocks = [SimpleModel() for _ in range(4)]
     block_idx_to_cpu = 0
     block_idx_to_cuda = 2

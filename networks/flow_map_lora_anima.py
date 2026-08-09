@@ -10,6 +10,9 @@ from networks import lora_anima
 
 
 class FlowMapLoRANetwork(lora_anima.LoRANetwork):
+    def is_mergeable(self):
+        return False
+
     def __init__(self, text_encoders, unet, *, interval_hidden_dim=128, **kwargs):
         super().__init__(text_encoders, unet, **kwargs)
         model_dim = int(unet.model_channels)
@@ -97,5 +100,6 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         modules_dim=dims,
         modules_alpha=alphas,
         interval_hidden_dim=hidden,
+        **lora_anima.get_resume_network_kwargs(kwargs, weights_sd),
     )
     return network, weights_sd

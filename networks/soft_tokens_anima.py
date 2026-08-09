@@ -9,6 +9,9 @@ import torch
 
 
 class SoftTokenNetwork(torch.nn.Module):
+    def is_mergeable(self):
+        return False
+
     def __init__(
         self,
         unet,

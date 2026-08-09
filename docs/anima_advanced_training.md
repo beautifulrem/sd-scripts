@@ -58,7 +58,7 @@ Then add:
 --repa_anneal_steps=0.3
 ```
 
-The three geometry values must match the training dataset's resolution area, `bucket_reso_steps`, and `max_bucket_reso`. New sidecars record their selected bucket and training fails early on a mismatch; regenerate sidecars created by an older version of the tool. REPA captures the selected block from the primary DiT forward, pools it to the cached vision grid and matches pairwise token relations. It needs no second DiT forward. DoG band-passes and standardizes the vision target before Gram alignment. Flip, color and random-crop augmentation are rejected because they invalidate spatial sidecars. Values in `(0,1]` for `repa_anneal_steps` are fractions of total steps.
+The three geometry values must match the training dataset's resolution area, `bucket_reso_steps`, and `max_bucket_reso`. If the dataset sets `resize_interpolation`, pass the same value as `--resize_interpolation` to the cache tool. New sidecars record their selected bucket and training fails early on a mismatch; regenerate sidecars created by an older version of the tool. REPA captures the selected block from the primary DiT forward, pools it to the cached vision grid and matches pairwise token relations. It needs no second DiT forward. DoG band-passes and standardizes the vision target before Gram alignment. Flip, color and random-crop augmentation are rejected because they invalidate spatial sidecars. Values in `(0,1]` for `repa_anneal_steps` are fractions of total steps.
 
 ## Self-Flow
 
@@ -89,7 +89,7 @@ python anima_minimal_inference.py \
   --adapter_weight=/path/to/flow_map.safetensors
 ```
 
-The same loader supports full Soft Token, Hydra, and Chimera checkpoints and supplies their sigma/frequency context. Ordinary or lossy standard LoRA exports should continue to use `--lora_weight`. EasyControl needs condition-latent preparation and remains on the ControlNet-style training sampler.
+The same loader supports full Soft Token, Hydra, Chimera, and EasyControl checkpoints and supplies their runtime context. Ordinary or lossy standard LoRA exports should continue to use `--lora_weight`. For EasyControl, add `--control_image /path/to/control.png`; batch and interactive prompt lines may override it with `--cn /path/to/control.png`. The condition image is resized to the requested output size and encoded with the same Anima VAE before denoising.
 
 ## DP-DMD Turbo
 

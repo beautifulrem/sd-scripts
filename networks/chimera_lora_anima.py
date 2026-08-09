@@ -95,6 +95,9 @@ class ChimeraLoRAModule(hydra_lora_anima.HydraLoRAModule):
 
 
 class ChimeraLoRANetwork(hydra_lora_anima.HydraLoRANetwork):
+    def is_mergeable(self):
+        return False
+
     def __init__(self, text_encoders, unet, *, num_frequency_experts=2, **kwargs):
         self.num_frequency_experts = int(num_frequency_experts)
         num_experts = int(kwargs.pop("num_experts", 4))
@@ -229,5 +232,9 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         modules_alpha=alphas,
         num_experts=max(content_ids) + 1,
         num_frequency_experts=max(frequency_ids) + 1,
+        balance_weight=float(kwargs.get("balance_weight", 0.01)),
+        orthogonal_weight=float(kwargs.get("orthogonal_weight", 0.01)),
+        export_mode=kwargs.get("export_mode", "full"),
+        **lora_anima.get_resume_network_kwargs(kwargs, weights_sd),
     )
     return network, weights_sd

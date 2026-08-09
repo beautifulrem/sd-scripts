@@ -118,9 +118,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae_disable_cache", action="store_true")
     parser.add_argument("--qwen_image_vae_2d", action="store_true")
     parser.add_argument("--text_encoder", type=str, required=True, help="Qwen3 Text Encoder path")
+    parser.add_argument("--llm_adapter_path", type=str, default=None, help="Separate Anima LLM adapter weights")
 
     parser.add_argument("--lora_weight", type=str, nargs="*", default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None)
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None)
 

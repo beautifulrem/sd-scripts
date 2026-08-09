@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .anima_network_base import AdditionalNetwork, get_anima_arch_config, _parse_kv_pairs
+from .anima_network_base import AdditionalNetwork, apply_loraplus_args, get_anima_arch_config, _parse_kv_pairs
 from library.utils import setup_logging
 
 setup_logging()
@@ -499,15 +499,7 @@ def create_network(
         verbose=verbose,
     )
 
-    # LoRA+ support
-    loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
-    loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
-    loraplus_text_encoder_lr_ratio = kwargs.get("loraplus_text_encoder_lr_ratio", None)
-    loraplus_lr_ratio = float(loraplus_lr_ratio) if loraplus_lr_ratio is not None else None
-    loraplus_unet_lr_ratio = float(loraplus_unet_lr_ratio) if loraplus_unet_lr_ratio is not None else None
-    loraplus_text_encoder_lr_ratio = float(loraplus_text_encoder_lr_ratio) if loraplus_text_encoder_lr_ratio is not None else None
-    if loraplus_lr_ratio is not None or loraplus_unet_lr_ratio is not None or loraplus_text_encoder_lr_ratio is not None:
-        network.set_loraplus_lr_ratio(loraplus_lr_ratio, loraplus_unet_lr_ratio, loraplus_text_encoder_lr_ratio)
+    apply_loraplus_args(network, kwargs)
 
     return network
 
@@ -562,7 +554,16 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         module_class=module_class,
         module_kwargs=module_kwargs,
         train_llm_adapter=train_llm_adapter,
+        dropout=float(kwargs["dropout"]) if kwargs.get("dropout") is not None else None,
+        rank_dropout=float(kwargs["rank_dropout"]) if kwargs.get("rank_dropout") is not None else None,
+        module_dropout=float(kwargs["module_dropout"]) if kwargs.get("module_dropout") is not None else None,
+        reg_lrs=(
+            _parse_kv_pairs(kwargs["network_reg_lrs"], is_int=False)
+            if kwargs.get("network_reg_lrs") is not None
+            else None
+        ),
     )
+    apply_loraplus_args(network, kwargs)
     return network, weights_sd
 
 

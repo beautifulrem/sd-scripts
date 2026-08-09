@@ -185,6 +185,7 @@ class AnimaNetworkTrainer(anima_network_trainer.AnimaNetworkTrainerBase):
             loading_device,
             loading_dtype,
             False,
+            llm_adapter_path=args.llm_adapter_path,
         )
 
         # Store unsloth preference so that the Anima trainer base can
@@ -498,6 +499,10 @@ class AnimaNetworkTrainer(anima_network_trainer.AnimaNetworkTrainerBase):
                     )
                     if unwrapped_network is not None and hasattr(unwrapped_network, "set_timestep_mask"):
                         unwrapped_network.set_timestep_mask(next_sigmas)
+                    if unwrapped_network is not None and hasattr(unwrapped_network, "set_step_sigmas"):
+                        unwrapped_network.set_step_sigmas(next_sigmas)
+                    if unwrapped_network is not None and hasattr(unwrapped_network, "set_frequency_context"):
+                        unwrapped_network.set_frequency_context(next_sigmas, transported)
                     self_flow_pred = anima(
                         transported,
                         next_sigmas,

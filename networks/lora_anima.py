@@ -42,6 +42,19 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
 
+        for name, value, upper_inclusive in (
+            ("dropout", dropout, True),
+            ("rank_dropout", rank_dropout, False),
+            ("module_dropout", module_dropout, True),
+        ):
+            if value is None:
+                continue
+            value = float(value)
+            valid = 0.0 <= value <= 1.0 if upper_inclusive else 0.0 <= value < 1.0
+            if not valid:
+                interval = "[0, 1]" if upper_inclusive else "[0, 1)"
+                raise ValueError(f"{name} must be in {interval}, got {value}")
+
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
@@ -545,6 +558,32 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
             train_llm_adapter = True
 
     module_class = LoRAInfModule if for_inference else LoRAModule
+    dropout = kwargs.get("dropout", kwargs.get("neuron_dropout", None))
+    dropout = float(dropout) if dropout is not None else None
+    rank_dropout = kwargs.get("rank_dropout", None)
+    rank_dropout = float(rank_dropout) if rank_dropout is not None else None
+    module_dropout = kwargs.get("module_dropout", None)
+    module_dropout = float(module_dropout) if module_dropout is not None else None
+    use_timestep_mask = str(kwargs.get("use_timestep_mask", "false")).lower() == "true"
+    min_rank = int(kwargs.get("min_rank", 1))
+    alpha_rank_scale = float(kwargs.get("alpha_rank_scale", 1.0))
+    if not use_timestep_mask and ("min_rank" in kwargs or "alpha_rank_scale" in kwargs):
+        raise ValueError("min_rank/alpha_rank_scale require use_timestep_mask=true")
+
+    def parse_float_pairs(value):
+        if value is None:
+            return None
+        pairs = {}
+        for pair in str(value).split(","):
+            if pair.strip():
+                pattern, lr = pair.split("=", 1)
+                pairs[pattern.strip()] = float(lr)
+        return pairs
+
+    channel_scales = {}
+    for key, value in weights_sd.items():
+        if key.endswith(".inv_scale"):
+            channel_scales[key.rsplit(".", 1)[0]] = value.detach().float().reciprocal()
 
     network = LoRANetwork(
         text_encoders,
@@ -554,8 +593,52 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         modules_alpha=modules_alpha,
         module_class=module_class,
         train_llm_adapter=train_llm_adapter,
+        dropout=dropout,
+        rank_dropout=rank_dropout,
+        module_dropout=module_dropout,
+        reg_lrs=parse_float_pairs(kwargs.get("network_reg_lrs", None)),
+        use_timestep_mask=use_timestep_mask,
+        min_rank=min_rank,
+        alpha_rank_scale=alpha_rank_scale,
+        channel_scales=channel_scales or None,
     )
+    ratios = (
+        kwargs.get("loraplus_lr_ratio", None),
+        kwargs.get("loraplus_unet_lr_ratio", None),
+        kwargs.get("loraplus_text_encoder_lr_ratio", None),
+    )
+    ratios = tuple(float(value) if value is not None else None for value in ratios)
+    if any(value is not None for value in ratios):
+        network.set_loraplus_lr_ratio(*ratios)
     return network, weights_sd
+
+
+def get_resume_network_kwargs(kwargs, weights_sd) -> dict:
+    """Behavioral options that cannot be inferred from ordinary LoRA tensors."""
+    dropout = kwargs.get("dropout", kwargs.get("neuron_dropout", None))
+    network_kwargs = {
+        "dropout": float(dropout) if dropout is not None else None,
+        "rank_dropout": float(kwargs["rank_dropout"]) if kwargs.get("rank_dropout") is not None else None,
+        "module_dropout": float(kwargs["module_dropout"]) if kwargs.get("module_dropout") is not None else None,
+        "use_timestep_mask": str(kwargs.get("use_timestep_mask", "false")).lower() == "true",
+        "min_rank": int(kwargs.get("min_rank", 1)),
+        "alpha_rank_scale": float(kwargs.get("alpha_rank_scale", 1.0)),
+    }
+    if not network_kwargs["use_timestep_mask"] and ("min_rank" in kwargs or "alpha_rank_scale" in kwargs):
+        raise ValueError("min_rank/alpha_rank_scale require use_timestep_mask=true")
+    reg_lrs = kwargs.get("network_reg_lrs")
+    if reg_lrs:
+        network_kwargs["reg_lrs"] = {
+            pattern.strip(): float(value) for pattern, value in (pair.split("=", 1) for pair in str(reg_lrs).split(","))
+        }
+    channel_scales = {
+        key.rsplit(".", 1)[0]: value.detach().float().reciprocal()
+        for key, value in weights_sd.items()
+        if key.endswith(".inv_scale")
+    }
+    if channel_scales:
+        network_kwargs["channel_scales"] = channel_scales
+    return network_kwargs
 
 
 class LoRANetwork(torch.nn.Module):
@@ -680,7 +763,9 @@ class LoRANetwork(torch.nn.Module):
                             if modules_dim is not None:
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
-                                    alpha_val = modules_alpha[lora_name]
+                                    # Some standard LoRA exporters omit alpha;
+                                    # in that format alpha defaults to rank.
+                                    alpha_val = modules_alpha.get(lora_name, dim)
                             else:
                                 if self.reg_dims is not None:
                                     for reg, d in self.reg_dims.items():

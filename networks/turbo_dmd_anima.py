@@ -174,5 +174,6 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         multiplier=multiplier,
         modules_dim=dims,
         modules_alpha=alphas,
+        **lora_anima.get_resume_network_kwargs(kwargs, weights_sd),
     )
     return network, weights_sd

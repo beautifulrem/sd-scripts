@@ -229,12 +229,9 @@ class AnimaNetworkTrainerBase:
         )
         huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = loss_util.conditional_loss(prediction.float(), target.float(), args.loss_type, "none", huber_c)
-        if weighting is not None:
-            loss = loss * weighting
         if args.masked_loss or batch.get("alpha_masks") is not None:
             loss = apply_masked_loss(loss, batch)
-        loss = loss.mean(dim=list(range(1, loss.ndim)))
-        loss = loss * batch["loss_weights"]
+        loss = loss_util.reduce_weighted_loss(loss, weighting, batch["loss_weights"])
         return self.post_process_loss(loss, args, timesteps, noise_scheduler).mean()
 
     def cast_text_encoder(self, args):
@@ -818,6 +815,12 @@ class AnimaNetworkTrainerBase:
                 module, weights_sd = network_module.create_network_from_weights(
                     multiplier, weight_path, vae, text_encoder, unet, for_inference=True
                 )
+                is_mergeable = getattr(module, "is_mergeable", None)
+                if not callable(is_mergeable) or not is_mergeable() or not callable(getattr(module, "merge_to", None)):
+                    raise ValueError(
+                        f"{args.network_module} checkpoint {weight_path} contains a full Anima adapter and cannot be "
+                        "merged with --base_weights; load it as --network_weights instead"
+                    )
                 module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
 
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
@@ -829,14 +832,15 @@ class AnimaNetworkTrainerBase:
                 key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
+        if "dropout" not in net_kwargs:
+            # Keep resume/dim-from-weights behavior consistent with newly
+            # created networks and with LyCORIS-style module arguments.
+            net_kwargs["dropout"] = args.network_dropout
+
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
             network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
         else:
-            if "dropout" not in net_kwargs:
-                # workaround for LyCORIS (;^ω^)
-                net_kwargs["dropout"] = args.network_dropout
-
             network = network_module.create_network(
                 1.0,
                 args.network_dim,
@@ -1054,7 +1058,10 @@ class AnimaNetworkTrainerBase:
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
 
-        if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
+        needs_vae_during_training = hasattr(accelerator.unwrap_model(network), "set_condition_latents")
+        if not cache_latents or needs_vae_during_training:
+            # EasyControl still encodes its conditioning image every step even
+            # when target latents have been cached.
             vae.requires_grad_(False)
             vae.eval()
             vae.to(accelerator.device, dtype=vae_dtype)

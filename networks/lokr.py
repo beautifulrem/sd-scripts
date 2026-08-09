@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .anima_network_base import AdditionalNetwork, get_anima_arch_config, _parse_kv_pairs
+from .anima_network_base import AdditionalNetwork, apply_loraplus_args, get_anima_arch_config, _parse_kv_pairs
 from library.utils import setup_logging
 
 setup_logging()
@@ -54,6 +54,69 @@ def factorization(dimension: int, factor: int = -1) -> tuple:
     if m > n:
         n, m = m, n
     return m, n
+
+
+def _collect_target_dimensions(root_module, prefix, target_module_names):
+    """Map serialized adapter names to their source module input/output sizes."""
+    dimensions = {}
+    if root_module is None:
+        return dimensions
+    for name, module in root_module.named_modules():
+        if module.__class__.__name__ not in target_module_names:
+            continue
+        for child_name, child_module in module.named_modules():
+            if child_module.__class__.__name__ == "Linear":
+                in_dim, out_dim = child_module.in_features, child_module.out_features
+            elif child_module.__class__.__name__ == "Conv2d":
+                in_dim, out_dim = child_module.in_channels, child_module.out_channels
+            else:
+                continue
+            original_name = (name + "." if name else "") + child_name
+            dimensions[f"{prefix}.{original_name}".replace(".", "_")] = (in_dim, out_dim)
+    return dimensions
+
+
+def _infer_factor_from_weights(weights_sd, text_encoders, unet, arch_config, train_llm_adapter):
+    """Infer a shape-compatible LoKr factor when a checkpoint does not record it."""
+    target_dimensions = {}
+    for index, text_encoder in enumerate(text_encoders):
+        prefix = arch_config.te_prefixes[min(index, len(arch_config.te_prefixes) - 1)]
+        target_dimensions.update(_collect_target_dimensions(text_encoder, prefix, arch_config.te_target_modules))
+
+    unet_targets = list(arch_config.unet_target_modules)
+    if train_llm_adapter:
+        unet_targets.extend(arch_config.adapter_target_modules)
+    target_dimensions.update(_collect_target_dimensions(unet, arch_config.unet_prefix, unet_targets))
+
+    shape_constraints = []
+    for key, value in weights_sd.items():
+        if not key.endswith(".lokr_w1") or value.ndim != 2:
+            continue
+        lora_name = key.rsplit(".", 1)[0]
+        if lora_name in target_dimensions:
+            in_dim, out_dim = target_dimensions[lora_name]
+            shape_constraints.append((in_dim, out_dim, tuple(value.shape)))
+
+    if not shape_constraints:
+        logger.warning("Could not infer LoKr factor from checkpoint targets; falling back to automatic factorization")
+        return -1
+
+    # The smallest factor that recreates every saved w1 shape is sufficient:
+    # different factor arguments with identical factorizations are behaviorally equivalent.
+    max_saved_factor = max(max(shape) for _, _, shape in shape_constraints)
+    for candidate in range(1, max_saved_factor + 1):
+        if all(
+            (factorization(out_dim, candidate)[0], factorization(in_dim, candidate)[0]) == saved_shape
+            for in_dim, out_dim, saved_shape in shape_constraints
+        ):
+            return candidate
+
+    if all(
+        (factorization(out_dim, -1)[0], factorization(in_dim, -1)[0]) == saved_shape
+        for in_dim, out_dim, saved_shape in shape_constraints
+    ):
+        return -1
+    raise ValueError("Unable to infer a LoKr factor compatible with the checkpoint; pass network_args factor=<value>")
 
 
 def make_kron(w1, w2, scale):
@@ -496,15 +559,7 @@ def create_network(
         verbose=verbose,
     )
 
-    # LoRA+ support
-    loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
-    loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
-    loraplus_text_encoder_lr_ratio = kwargs.get("loraplus_text_encoder_lr_ratio", None)
-    loraplus_lr_ratio = float(loraplus_lr_ratio) if loraplus_lr_ratio is not None else None
-    loraplus_unet_lr_ratio = float(loraplus_unet_lr_ratio) if loraplus_unet_lr_ratio is not None else None
-    loraplus_text_encoder_lr_ratio = float(loraplus_text_encoder_lr_ratio) if loraplus_text_encoder_lr_ratio is not None else None
-    if loraplus_lr_ratio is not None or loraplus_unet_lr_ratio is not None or loraplus_text_encoder_lr_ratio is not None:
-        network.set_loraplus_lr_ratio(loraplus_lr_ratio, loraplus_unet_lr_ratio, loraplus_text_encoder_lr_ratio)
+    apply_loraplus_args(network, kwargs)
 
     return network
 
@@ -557,8 +612,14 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
     # detect architecture
     arch_config = get_anima_arch_config(unet, text_encoders)
 
-    # extract factor for LoKr
-    factor = int(kwargs.get("factor", -1))
+    # Older checkpoints do not record factor. Reconstruct it from lokr_w1 and
+    # source-module shapes unless the caller explicitly overrides it.
+    factor_arg = kwargs.get("factor")
+    factor = (
+        int(factor_arg)
+        if factor_arg is not None
+        else _infer_factor_from_weights(weights_sd, text_encoders, unet, arch_config, train_llm_adapter)
+    )
 
     module_class = LoKrInfModule if for_inference else LoKrModule
     module_kwargs = {"factor": factor, "use_tucker": use_tucker}
@@ -573,7 +634,16 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         module_class=module_class,
         module_kwargs=module_kwargs,
         train_llm_adapter=train_llm_adapter,
+        dropout=float(kwargs["dropout"]) if kwargs.get("dropout") is not None else None,
+        rank_dropout=float(kwargs["rank_dropout"]) if kwargs.get("rank_dropout") is not None else None,
+        module_dropout=float(kwargs["module_dropout"]) if kwargs.get("module_dropout") is not None else None,
+        reg_lrs=(
+            _parse_kv_pairs(kwargs["network_reg_lrs"], is_int=False)
+            if kwargs.get("network_reg_lrs") is not None
+            else None
+        ),
     )
+    apply_loraplus_args(network, kwargs)
     return network, weights_sd
 
 

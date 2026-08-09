@@ -4,6 +4,7 @@ import gc
 import importlib
 import random
 import os
+import re
 import time
 import copy
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ from library import (
 )
 from library.device_utils import clean_memory_on_device, synchronize_device
 
-from library.utils import setup_logging
+from library.utils import IMAGE_TRANSFORMS, setup_logging
 
 setup_logging()
 import logging
@@ -66,10 +67,11 @@ def parse_args() -> argparse.Namespace:
         + " / 画像専用の2D Qwen-Image VAE実装を使用します。公式Qwen-Image VAEの重みはロード時に変換されます。",
     )
     parser.add_argument("--text_encoder", type=str, required=True, help="Text Encoder 1 (Qwen2.5-VL) directory or path")
+    parser.add_argument("--llm_adapter_path", type=str, default=None, help="Separate Anima LLM adapter weights")
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -80,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--adapter_weight", type=str, default=None, help="Checkpoint for --adapter_module.")
     parser.add_argument("--adapter_multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--control_image",
+        type=str,
+        default=None,
+        help="Condition image for an EasyControl full adapter; prompt files may override it with --cn.",
+    )
 
     # inference
     parser.add_argument(
@@ -182,6 +190,8 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["flow_shift"] = float(value)
         elif option == "n":
             overrides["negative_prompt"] = value
+        elif option == "cn":
+            overrides["control_image"] = value
 
     return overrides
 
@@ -269,6 +279,7 @@ def load_dit_model(
         loading_device,
         loading_weight_dtype,
         args.fp8_scaled,
+        llm_adapter_path=getattr(args, "llm_adapter_path", None),
         lora_weights_list=lora_weights_list,
         lora_multipliers=args.lora_multiplier,
     )
@@ -298,11 +309,6 @@ def load_dit_model(
             model,
             for_inference=True,
         )
-        if hasattr(adapter, "set_condition_latents"):
-            raise ValueError(
-                "EasyControl full-adapter inference requires condition-latent preparation and is not supported by "
-                "anima_minimal_inference.py; use the ControlNet-style training sampler"
-            )
         adapter.apply_to([], model, apply_text_encoder=False, apply_unet=True)
         incompatible = adapter.load_state_dict(adapter_state, strict=False)
         if incompatible.missing_keys or incompatible.unexpected_keys:
@@ -348,6 +354,14 @@ def decode_latent(
 ) -> torch.Tensor:
     logger.info(f"Decoding image. Latent shape {latent.shape}, device {device}")
 
+    # Latents loaded by the decode-only path may be stored without a batch
+    # dimension as [C,T,H,W] or [C,H,W].  The VAE requires [B,C,T,H,W] or
+    # [B,C,H,W]; treating C as B silently produces nonsense images.
+    if latent.ndim == 4 and latent.shape[0] == vae.latent_channels:
+        latent = latent.unsqueeze(0)
+    elif latent.ndim == 3 and latent.shape[0] == vae.latent_channels:
+        latent = latent.unsqueeze(0)
+
     vae.to(device)
     with torch.no_grad():
         pixels = vae.decode_to_pixels(latent.to(device, dtype=vae.dtype))
@@ -371,7 +385,8 @@ def process_escape(text: str) -> str:
     Returns:
         str: Processed text
     """
-    return text.encode("utf-8").decode("unicode_escape")
+    escape_pattern = re.compile(r"\\(?:[\\abfnrtv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})")
+    return escape_pattern.sub(lambda match: match.group(0).encode("ascii").decode("unicode_escape"), text)
 
 
 def prepare_text_inputs(
@@ -531,7 +546,44 @@ def generate(
         logger.info("No precomputed data. Preparing image and text inputs.")
         context, context_null = prepare_text_inputs(args, device, anima, shared_models)
 
-    return generate_body(args, anima, context, context_null, device, seed)
+    adapter = getattr(anima, "_anima_external_adapter", None)
+    condition_vae = None
+    owns_condition_vae = False
+    try:
+        if adapter is not None and hasattr(adapter, "set_condition_latents"):
+            condition_vae = shared_models.get("vae") if shared_models is not None else None
+            if condition_vae is None:
+                condition_vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+                condition_vae.to(torch.bfloat16).eval()
+                owns_condition_vae = True
+            _prepare_easycontrol_condition(args, adapter, condition_vae, device)
+            condition_vae.to("cpu")
+            clean_memory_on_device(device)
+        return generate_body(args, anima, context, context_null, device, seed)
+    finally:
+        if adapter is not None and hasattr(adapter, "clear_condition_latents"):
+            adapter.clear_condition_latents()
+        if owns_condition_vae and condition_vae is not None:
+            condition_vae.to("cpu")
+            del condition_vae
+            clean_memory_on_device(device)
+
+
+def _prepare_easycontrol_condition(args, adapter, vae, device: torch.device) -> None:
+    control_image = getattr(args, "control_image", None)
+    if not control_image:
+        raise ValueError("EasyControl inference requires --control_image (or --cn in a prompt file)")
+    if not os.path.isfile(control_image):
+        raise FileNotFoundError(f"EasyControl condition image not found: {control_image}")
+
+    height, width = check_inputs(args)
+    with Image.open(control_image) as image:
+        image = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        pixels = IMAGE_TRANSFORMS(image).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+    vae.to(device=device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        condition_latents = vae.encode_pixels_to_latents(pixels)
+    adapter.set_condition_latents(condition_latents)
 
 
 def generate_body(
@@ -702,7 +754,7 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
 
     logger.info(f"Sample images saved to: {save_path}/{image_name}")
 
-    return f"{save_path}/{image_name}"
+    return os.path.join(save_path, f"{image_name}.png")
 
 
 def save_output(
@@ -817,10 +869,12 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     device = gen_settings.device
 
     # 1. Prepare VAE
-    logger.info("Loading VAE for batch generation...")
-    vae_for_batch = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-    vae_for_batch.to(torch.bfloat16)
-    vae_for_batch.eval()
+    vae_for_batch = None
+    if args.output_type != "latent":
+        logger.info("Loading VAE for batch generation...")
+        vae_for_batch = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+        vae_for_batch.to(torch.bfloat16)
+        vae_for_batch.eval()
 
     all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
     for prompt_args in all_prompt_args_list:
@@ -832,7 +886,9 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     first_prompt_args = all_prompt_args_list[0]
     anima = load_dit_model(first_prompt_args, device, dit_weight_dtype)  # Load directly to target device if possible
 
-    shared_models_for_generate = {"model": anima}  # Pass DiT via shared_models
+    shared_models_for_generate = {"model": anima}
+    if vae_for_batch is not None:
+        shared_models_for_generate["vae"] = vae_for_batch
 
     # 3. Precompute Text Data (Text Encoder)
     logger.info("Loading Text Encoder for batch text preprocessing...")
@@ -943,6 +999,7 @@ def process_interactive(args: argparse.Namespace) -> None:
     vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
     vae.to(torch.bfloat16)
     vae.eval()
+    shared_models["vae"] = vae
 
     print("Interactive mode. Enter prompts (Ctrl+D or Ctrl+Z (Windows) to exit):")
 
@@ -1056,9 +1113,6 @@ def main():
             seeds.append(seed)
             logger.info(f"Loaded latent from {latent_path}. Shape: {latents.shape}")
 
-            if latents.ndim == 5:  # [BCTHW]
-                latents = latents.squeeze(0)  # [CTHW]
-
             latents_list.append(latents)
 
         vae = anima_train_utils.load_qwen_image_vae(args, device=device, disable_mmap=True)
@@ -1106,9 +1160,11 @@ def main():
             clean_memory_on_device(device)
 
             # Save latent and video
-            vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-            vae.to(torch.bfloat16)
-            vae.eval()
+            vae = None
+            if args.output_type != "latent":
+                vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
+                vae.to(torch.bfloat16)
+                vae.eval()
             save_output(args, vae, latent, device)
 
     logger.info("Done!")

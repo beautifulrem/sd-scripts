@@ -121,9 +121,29 @@ def get_noisy_model_input_and_timesteps(
             args.logit_std,
             args.mode_scale,
         )
-        indices = (density * num_timesteps).long()
+        # Custom density functions may legitimately hit the closed endpoint
+        # 1.0 (for example mode sampling when its uniform draw is exactly 0).
+        # Scheduler storage is zero-indexed, so keep the rare endpoint in range.
+        indices = (density * num_timesteps).long().clamp_(0, num_timesteps - 1)
         timesteps = noise_scheduler.timesteps[indices].to(device=device)
         sigmas = _get_sigmas(noise_scheduler, timesteps, device, dtype=dtype)
+
+    # Restrict every sampling distribution to the requested training interval.
+    # The command-line bounds are expressed in the scheduler's 0..N timestep
+    # space, while the distributions above produce sigma values in 0..1.
+    min_timestep = getattr(args, "min_timestep", None)
+    max_timestep = getattr(args, "max_timestep", None)
+    min_timestep = 0 if min_timestep is None else min_timestep
+    max_timestep = num_timesteps if max_timestep is None else max_timestep
+    if not 0 <= min_timestep <= max_timestep <= num_timesteps:
+        raise ValueError(
+            f"Anima timestep range must satisfy 0 <= min_timestep <= max_timestep <= {num_timesteps}, "
+            f"got {min_timestep}..{max_timestep}"
+        )
+    min_sigma = min_timestep / num_timesteps
+    sigma_span = (max_timestep - min_timestep) / num_timesteps
+    sigmas = min_sigma + sigmas * sigma_span
+    timesteps = sigmas * num_timesteps
 
     broadcast_shape = (-1,) + (1,) * (latents.ndim - 1)
     sigmas = sigmas.view(broadcast_shape)

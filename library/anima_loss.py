@@ -6,12 +6,17 @@ from typing import Optional
 import torch
 
 
-def apply_masked_loss(loss: torch.Tensor, batch: dict) -> torch.Tensor:
-    if "conditioning_images" in batch:
+def apply_masked_loss(
+    loss: torch.Tensor,
+    batch: dict,
+    *,
+    conditioning_image_is_mask: bool = True,
+) -> torch.Tensor:
+    if batch.get("alpha_masks") is not None:
+        mask = batch["alpha_masks"].to(dtype=loss.dtype).unsqueeze(1)
+    elif conditioning_image_is_mask and "conditioning_images" in batch:
         mask = batch["conditioning_images"].to(dtype=loss.dtype)[:, 0].unsqueeze(1)
         mask = mask / 2 + 0.5
-    elif batch.get("alpha_masks") is not None:
-        mask = batch["alpha_masks"].to(dtype=loss.dtype).unsqueeze(1)
     else:
         return loss
     mask = torch.nn.functional.interpolate(mask, size=loss.shape[2:], mode="area")
@@ -24,9 +29,10 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
 
     batch_size = timesteps.shape[0]
     if args.huber_schedule == "exponential":
-        num_timesteps = noise_scheduler.config.num_train_timesteps
-        alpha = -math.log(args.huber_c) / num_timesteps
-        return torch.exp(-alpha * timesteps) * args.huber_scale
+        # Training passes scheduler timesteps in [0, num_train_timesteps].
+        # Interpolate from huber_scale at t=0 to huber_c*huber_scale at t=N.
+        normalized_timesteps = timesteps / noise_scheduler.config.num_train_timesteps
+        return torch.exp(math.log(args.huber_c) * normalized_timesteps) * args.huber_scale
     if args.huber_schedule == "constant":
         return torch.full((batch_size,), args.huber_c * args.huber_scale, device=timesteps.device)
     raise ValueError("Anima supports only 'constant' and 'exponential' Huber schedules")
@@ -59,3 +65,21 @@ def conditional_loss(
     if reduction == "sum":
         return loss.sum()
     return loss
+
+
+def reduce_weighted_loss(
+    elementwise_loss: torch.Tensor,
+    timestep_weighting: Optional[torch.Tensor],
+    sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Return one loss per sample without cross-batch broadcasting.
+
+    Timestep weights have latent-shaped singleton dimensions, whereas dataset
+    weights are one-dimensional.  Applying both only after spatial reduction
+    can accidentally form a B-by-B outer product.
+    """
+
+    if timestep_weighting is not None:
+        elementwise_loss = elementwise_loss * timestep_weighting
+    per_sample = elementwise_loss.mean(dim=tuple(range(1, elementwise_loss.ndim)))
+    return per_sample * sample_weights.to(device=per_sample.device, dtype=per_sample.dtype)

@@ -1147,6 +1147,12 @@ class Anima(nn.Module):
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
         use_llm_adapter: bool = False,
+        llm_adapter_source_dim: int = 1024,
+        llm_adapter_target_dim: int = 1024,
+        llm_adapter_model_dim: int = 1024,
+        llm_adapter_num_layers: int = 6,
+        llm_adapter_num_heads: int = 16,
+        llm_adapter_self_attn: bool = True,
         attn_mode: str = "torch",
         split_attn: bool = False,
     ) -> None:
@@ -1195,11 +1201,12 @@ class Anima(nn.Module):
 
         if self.use_llm_adapter:
             self.llm_adapter = LLMAdapter(
-                source_dim=1024,
-                target_dim=1024,
-                model_dim=1024,
-                num_layers=6,
-                self_attn=True,
+                source_dim=llm_adapter_source_dim,
+                target_dim=llm_adapter_target_dim,
+                model_dim=llm_adapter_model_dim,
+                num_layers=llm_adapter_num_layers,
+                num_heads=llm_adapter_num_heads,
+                self_attn=llm_adapter_self_attn,
             )
 
         self.blocks = nn.ModuleList(
@@ -1455,7 +1462,9 @@ class Anima(nn.Module):
     def _preprocess_text_embeds(
         self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None
     ):
-        if target_input_ids is not None:
+        if target_input_ids is not None and self.use_llm_adapter:
+            if not hasattr(self, "llm_adapter"):
+                raise RuntimeError("Anima is configured to use an LLM adapter, but no adapter module is loaded")
             context = self.llm_adapter(
                 source_hidden_states,
                 target_input_ids,

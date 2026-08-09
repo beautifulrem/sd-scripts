@@ -1081,15 +1081,15 @@ class BaseDataset(torch.utils.data.Dataset):
                 if not os.path.isfile(feature_path):
                     raise FileNotFoundError(f"REPA feature sidecar missing: {feature_path}")
                 feature_dict = load_file(feature_path)
-                if self.repa_feature_key not in feature_dict:
-                    raise KeyError(f"REPA sidecar {feature_path} has no key {self.repa_feature_key!r}")
-                cached_bucket_size = feature_dict.get("anima_bucket_size")
-                if cached_bucket_size is not None and tuple(cached_bucket_size.tolist()) != tuple(image_info.bucket_reso):
-                    raise ValueError(
-                        f"REPA sidecar {feature_path} was cached for bucket {tuple(cached_bucket_size.tolist())}, "
-                        f"but training selected {tuple(image_info.bucket_reso)}; regenerate it with matching "
-                        "target_pixels, resolution_step and max_bucket_reso"
-                    )
+                from library.anima_repa import validate_repa_sidecar
+
+                validate_repa_sidecar(
+                    feature_dict,
+                    feature_path,
+                    self.repa_feature_key,
+                    image_info.bucket_reso,
+                    image_info.resize_interpolation,
+                )
                 repa_features.append(feature_dict[self.repa_feature_key].float())
 
             # in case of fine tuning, is_reg is always False

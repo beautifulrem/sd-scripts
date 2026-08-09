@@ -17,6 +17,8 @@ def _sampling_args(mode: str) -> SimpleNamespace:
         mode_scale=1.29,
         ip_noise_gamma=0.0,
         ip_noise_gamma_random_strength=False,
+        min_timestep=None,
+        max_timestep=None,
     )
 
 
@@ -72,6 +74,56 @@ def test_flow_offset_moves_sigmoid_samples_later():
     assert torch.all(shifted > base)
 
 
+@pytest.mark.parametrize("mode", ["uniform", "sigmoid", "shift", "flux_shift", "sigma"])
+def test_flow_sampling_honors_timestep_range(mode):
+    args = _sampling_args(mode)
+    args.min_timestep = 200
+    args.max_timestep = 400
+    scheduler = anima_flow_matching.AnimaFlowMatchScheduler(shift=args.discrete_flow_shift)
+    latents = torch.zeros(64, 1, 2, 2)
+    noise = torch.ones_like(latents)
+
+    _, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
+        args, scheduler, latents, noise, "cpu", torch.float32
+    )
+
+    assert torch.all((timesteps >= 200) & (timesteps <= 400))
+    torch.testing.assert_close(sigmas.flatten(), timesteps / 1000)
+
+
+def test_flow_sampling_supports_fixed_validation_timestep():
+    args = _sampling_args("sigmoid")
+    args.min_timestep = args.max_timestep = 375
+    scheduler = anima_flow_matching.AnimaFlowMatchScheduler(shift=args.discrete_flow_shift)
+    latents = torch.zeros(3, 1, 2, 2)
+    noise = torch.ones_like(latents)
+
+    noisy, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
+        args, scheduler, latents, noise, "cpu", torch.float32
+    )
+
+    torch.testing.assert_close(timesteps, torch.full((3,), 375.0))
+    torch.testing.assert_close(sigmas.flatten(), torch.full((3,), 0.375))
+    torch.testing.assert_close(noisy, sigmas.expand_as(noisy))
+
+
+def test_sigma_density_closed_endpoint_does_not_overrun_scheduler(monkeypatch):
+    args = _sampling_args("sigma")
+    scheduler = anima_flow_matching.AnimaFlowMatchScheduler(shift=args.discrete_flow_shift)
+    monkeypatch.setattr(
+        anima_flow_matching,
+        "_compute_timestep_density",
+        lambda _scheme, batch_size, *_args: torch.ones(batch_size),
+    )
+
+    _, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
+        args, scheduler, torch.zeros(2, 1, 2, 2), torch.ones(2, 1, 2, 2), "cpu", torch.float32
+    )
+
+    assert torch.isfinite(timesteps).all()
+    assert torch.isfinite(sigmas).all()
+
+
 def test_anima_loss_weighting_and_huber_thresholds():
     sigmas = torch.tensor([0.25, 0.5])
     assert torch.allclose(anima_train_utils.compute_loss_weighting_for_anima("sigma_sqrt", sigmas), sigmas**-2)
@@ -87,6 +139,40 @@ def test_anima_loss_weighting_and_huber_thresholds():
     loss = anima_loss.conditional_loss(prediction, target, "huber", "none", threshold)
     assert loss.shape == prediction.shape
     assert torch.isfinite(loss).all()
+
+    args.huber_schedule = "exponential"
+    threshold = anima_loss.get_huber_threshold_if_needed(
+        args, torch.tensor([0.0, 500.0, 1000.0]), scheduler
+    )
+    torch.testing.assert_close(threshold, torch.tensor([2.0, 2.0 * 0.1**0.5, 0.2]))
+
+
+def test_reduce_weighted_loss_keeps_weights_paired_with_samples():
+    elementwise = torch.tensor([1.0, 3.0]).view(2, 1, 1, 1)
+    timestep_weights = torch.tensor([2.0, 5.0]).view(2, 1, 1, 1)
+    sample_weights = torch.tensor([7.0, 11.0])
+
+    per_sample = anima_loss.reduce_weighted_loss(elementwise, timestep_weights, sample_weights)
+
+    torch.testing.assert_close(per_sample, torch.tensor([14.0, 165.0]))
+
+
+def test_masked_loss_prefers_explicit_alpha_mask_over_control_image():
+    loss = torch.ones(1, 1, 2, 2)
+    batch = {
+        "conditioning_images": -torch.ones(1, 3, 2, 2),
+        "alpha_masks": torch.ones(1, 2, 2),
+    }
+    torch.testing.assert_close(anima_loss.apply_masked_loss(loss, batch), loss)
+
+
+def test_masked_loss_can_reject_control_image_as_mask_source():
+    loss = torch.ones(1, 1, 2, 2)
+    batch = {"conditioning_images": -torch.ones(1, 3, 16, 16)}
+
+    masked = anima_loss.apply_masked_loss(loss, batch, conditioning_image_is_mask=False)
+
+    assert torch.equal(masked, loss)
 
 
 def test_prompt_file_parser_keeps_anima_sampling_fields(tmp_path):

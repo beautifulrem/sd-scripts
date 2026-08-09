@@ -11,6 +11,9 @@ from library import anima_models, attention
 
 
 class EasyControlNetwork(torch.nn.Module):
+    def is_mergeable(self):
+        return False
+
     def __init__(self, unet, *, rank=16, condition_channels=16, multiplier=1.0):
         super().__init__()
         self.model_dim = int(unet.model_channels)

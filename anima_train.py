@@ -242,7 +242,13 @@ def train(args):
     # Load DiT (MiniTrainDIT + optional LLM Adapter)
     logger.info("Loading Anima DiT...")
     dit = anima_utils.load_anima_model(
-        "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
+        "cpu",
+        args.pretrained_model_name_or_path,
+        args.attn_mode,
+        args.split_attn,
+        "cpu",
+        dit_weight_dtype=None,
+        llm_adapter_path=args.llm_adapter_path,
     )
 
     if args.gradient_checkpointing:
@@ -578,14 +584,7 @@ def train(args):
                 loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
-
-                if weighting is not None:
-                    loss = loss * weighting
-
-                loss_weights = batch["loss_weights"]
-                loss = loss * loss_weights
-                loss = loss.mean()
+                loss = loss_util.reduce_weighted_loss(loss, weighting, batch["loss_weights"]).mean()
 
                 accelerator.backward(loss)
 

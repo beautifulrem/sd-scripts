@@ -1,13 +1,20 @@
 from argparse import Namespace
+from pathlib import Path
+import subprocess
+import sys
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from library import anima_models, compile_utils
+from library.anima_repa import repa_interpolation_code, validate_repa_sidecar
 from library.controlnet_dataset import ControlNetDataset
 from library.dataset import BucketManager
+from library.utils import trim_and_resize_if_required
 from networks.lora_anima import LoRAModule
-from tools.cache_anima_repa_features import free_fit_size
+from tools.cache_anima_repa_features import free_fit_geometry, free_fit_size, prepare_repa_image
 
 
 def test_free_fit_bucket_preserves_aspect_and_target_area():
@@ -32,8 +39,66 @@ def test_free_fit_allows_upscale_and_rejects_no_upscale_combination():
 @pytest.mark.parametrize("image_size", [(256, 523), (400, 1600), (1600, 900), (2048, 2048), (701, 256)])
 def test_repa_cache_free_fit_exactly_matches_training_bucket(image_size):
     manager = BucketManager(False, (1024, 1024), 256, 2048, 16, free_fit=True)
-    expected, _, _ = manager.select_bucket(*image_size)
+    expected, expected_resized, _ = manager.select_bucket(*image_size)
+    actual, actual_resized = free_fit_geometry(*image_size, 1024 * 1024, 16, 2048)
     assert free_fit_size(*image_size, 1024 * 1024, 16, 2048) == expected
+    assert (actual, actual_resized) == (expected, expected_resized)
+
+
+def test_repa_preprocessing_preserves_aspect_then_center_crops():
+    image = Image.fromarray(np.arange(80 * 160 * 3, dtype=np.uint8).reshape(80, 160, 3))
+    prepared = prepare_repa_image(image, (64, 64), (128, 64))
+    expected, _, _ = trim_and_resize_if_required(
+        False, np.asarray(image)[:, :, ::-1].copy(), (64, 64), (128, 64)
+    )
+    np.testing.assert_array_equal(np.asarray(prepared), expected[:, :, ::-1])
+
+
+def test_repa_preprocessing_honors_dataset_interpolation():
+    image = Image.fromarray(np.arange(17 * 31 * 3, dtype=np.uint8).reshape(17, 31, 3))
+    prepared = prepare_repa_image(image, (16, 16), (29, 16), "nearest")
+    expected, _, _ = trim_and_resize_if_required(
+        False, np.asarray(image)[:, :, ::-1].copy(), (16, 16), (29, 16), resize_interpolation="nearest"
+    )
+    np.testing.assert_array_equal(np.asarray(prepared), expected[:, :, ::-1])
+
+
+def test_repa_preprocessing_preserves_rgb_channels_with_pil_interpolation():
+    image = Image.new("RGB", (32, 16), color=(240, 20, 5))
+    prepared = prepare_repa_image(image, (16, 16), (32, 16), resize_interpolation="lanczos")
+    red, green, blue = np.asarray(prepared)[8, 8]
+
+    assert red > 200
+    assert green < 40
+    assert blue < 40
+
+
+def test_repa_sidecar_requires_bucket_metadata():
+    with pytest.raises(ValueError, match="no bucket metadata"):
+        validate_repa_sidecar({"tokens": torch.zeros(2, 3)}, "sample.safetensors", "tokens", (64, 64))
+
+
+def test_repa_sidecar_rejects_mismatched_interpolation():
+    sidecar = {
+        "tokens": torch.zeros(2, 3),
+        "anima_bucket_size": torch.tensor([64, 64]),
+        "anima_resize_interpolation": torch.tensor(repa_interpolation_code("bicubic")),
+    }
+    with pytest.raises(ValueError, match="resize interpolation"):
+        validate_repa_sidecar(sidecar, "sample.safetensors", "tokens", (64, 64), "lanczos")
+
+
+def test_repa_cache_tool_supports_documented_direct_entrypoint():
+    repository_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(repository_root / "tools/cache_anima_repa_features.py"), "--help"],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_controlnet_repa_configuration_reaches_delegate():

@@ -71,6 +71,9 @@ class HydraLoRAModule(lora_anima.LoRAModule):
 
 
 class HydraLoRANetwork(lora_anima.LoRANetwork):
+    def is_mergeable(self):
+        return False
+
     def __init__(
         self,
         text_encoders,
@@ -206,6 +209,9 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         modules_dim=modules_dim,
         modules_alpha=modules_alpha,
         num_experts=max(expert_indices) + 1,
-        export_mode="full",
+        balance_weight=float(kwargs.get("balance_weight", 0.01)),
+        orthogonal_weight=float(kwargs.get("orthogonal_weight", 0.01)),
+        export_mode=kwargs.get("export_mode", "full"),
+        **lora_anima.get_resume_network_kwargs(kwargs, weights_sd),
     )
     return network, weights_sd

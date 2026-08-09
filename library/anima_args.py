@@ -719,6 +719,21 @@ def verify_training_args(args: argparse.Namespace):
 
     enable_high_vram(args)
 
+    min_timestep = getattr(args, "min_timestep", None)
+    max_timestep = getattr(args, "max_timestep", None)
+    min_timestep = 0 if min_timestep is None else min_timestep
+    max_timestep = 1000 if max_timestep is None else max_timestep
+    if not 0 <= min_timestep <= max_timestep <= 1000:
+        raise ValueError(
+            "Anima timestep range must satisfy "
+            f"0 <= min_timestep <= max_timestep <= 1000, got {min_timestep}..{max_timestep}"
+        )
+    if getattr(args, "loss_type", None) in ("huber", "smooth_l1"):
+        if args.huber_c <= 0:
+            raise ValueError("huber_c must be positive")
+        if args.huber_scale <= 0:
+            raise ValueError("huber_scale must be positive")
+
     if args.cache_latents_to_disk and not args.cache_latents:
         args.cache_latents = True
         logger.warning(

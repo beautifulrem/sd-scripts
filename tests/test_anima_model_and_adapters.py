@@ -1,4 +1,5 @@
 import contextlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 
 import anima_minimal_inference
 from anima_train_network import AnimaNetworkTrainer, setup_parser
+from library import anima_utils
 from library.anima_models import Anima, LLMAdapter
 from networks import (
     chimera_lora_anima,
@@ -51,6 +53,67 @@ def _inputs():
     return torch.randn(1, 16, 1, 4, 4), torch.tensor([500.0]), torch.randn(1, 3, 32)
 
 
+def test_anima_checkpoint_shape_inference_supports_non_base_architecture():
+    shapes = {key: tuple(value.shape) for key, value in _tiny_anima().state_dict().items()}
+    config = anima_utils._infer_anima_dit_config_from_shapes(shapes)
+
+    assert config["model_channels"] == 64
+    assert config["num_blocks"] == 1
+    assert config["num_heads"] == 4
+    assert config["mlp_ratio"] == 2.0
+    assert config["crossattn_emb_channels"] == 32
+    assert config["patch_spatial"] == 2
+    assert config["concat_padding_mask"] is False
+    assert config["adaln_lora_dim"] == 8
+    assert config["use_llm_adapter"] is False
+
+
+def test_anima_loader_roundtrips_inferred_non_base_architecture(tmp_path):
+    from safetensors.torch import save_file
+
+    path = tmp_path / "tiny_anima.safetensors"
+    source = _tiny_anima()
+    save_file({key: value.contiguous() for key, value in source.state_dict().items()}, str(path))
+
+    restored = anima_utils.load_anima_model(
+        "cpu", str(path), "torch", False, "cpu", torch.float32
+    )
+    assert (restored.model_channels, restored.num_blocks, restored.num_heads) == (64, 1, 4)
+    assert restored.concat_padding_mask is False
+
+
+def test_anima_loader_combines_separate_llm_adapter_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    dit_path = tmp_path / "tiny_anima.safetensors"
+    adapter_path = tmp_path / "llm_adapter.safetensors"
+    source = _tiny_anima()
+    adapter = LLMAdapter(source_dim=32, target_dim=32, model_dim=32, num_layers=1, num_heads=4, self_attn=True)
+    save_file({key: value.contiguous() for key, value in source.state_dict().items()}, str(dit_path))
+    save_file({key: value.contiguous() for key, value in adapter.state_dict().items()}, str(adapter_path))
+
+    restored = anima_utils.load_anima_model(
+        "cpu",
+        str(dit_path),
+        "torch",
+        False,
+        "cpu",
+        torch.float32,
+        llm_adapter_path=str(adapter_path),
+    )
+
+    assert restored.use_llm_adapter is True
+    assert len(restored.llm_adapter.blocks) == 1
+    assert restored.llm_adapter.blocks[0].cross_attn.n_heads == 4
+    result = restored._preprocess_text_embeds(
+        torch.randn(1, 3, 32),
+        torch.randint(0, 128, (1, 4)),
+        torch.ones(1, 4, dtype=torch.bool),
+        torch.ones(1, 3, dtype=torch.bool),
+    )
+    assert result.shape == (1, 4, 32)
+
+
 def test_tiny_anima_full_finetune_forward_and_backward():
     torch.manual_seed(1)
     model = _tiny_anima().train()
@@ -89,6 +152,104 @@ def test_anima_lora_forward_backward_and_checkpoint_roundtrip(tmp_path):
     incompatible = reloaded.load_state_dict(state_dict, strict=False)
     assert not incompatible.missing_keys
     assert not incompatible.unexpected_keys
+
+
+def test_anima_lora_resume_restores_behavioral_options_and_missing_alpha():
+    source_model = _tiny_anima().requires_grad_(False)
+    source = lora_anima.create_network(1.0, 4, 4.0, None, [], source_model)
+    source.apply_to([], source_model, apply_text_encoder=False, apply_unet=True)
+    state = source.state_dict()
+    state = {key: value for key, value in state.items() if not key.endswith(".alpha")}
+
+    model = _tiny_anima().requires_grad_(False)
+    restored, _ = lora_anima.create_network_from_weights(
+        1.0,
+        "unused.safetensors",
+        None,
+        [],
+        model,
+        weights_sd=state,
+        dropout="0.1",
+        rank_dropout="0.2",
+        module_dropout="0.3",
+        use_timestep_mask="true",
+        min_rank="2",
+        alpha_rank_scale="1.5",
+        loraplus_unet_lr_ratio="2.0",
+    )
+    assert restored.unet_loras
+    assert all(float(module.alpha) == module.lora_dim for module in restored.unet_loras)
+    assert all(module.use_timestep_mask and module.min_rank == 2 for module in restored.unet_loras)
+    assert restored.dropout == 0.1
+    assert restored.rank_dropout == 0.2
+    assert restored.module_dropout == 0.3
+    assert restored.loraplus_unet_lr_ratio == 2.0
+
+
+def test_anima_lokr_resume_infers_factor_from_checkpoint_shapes():
+    source_model = _tiny_anima().requires_grad_(False)
+    source = lokr.create_network(1.0, 4, 4.0, None, [], source_model, factor="4")
+    source.apply_to([], source_model, apply_text_encoder=False, apply_unet=True)
+    state = source.state_dict()
+    assert any(value.shape == (4, 4) for key, value in state.items() if key.endswith(".lokr_w1"))
+
+    restored_model = _tiny_anima().requires_grad_(False)
+    restored, _ = lokr.create_network_from_weights(
+        1.0,
+        "unused.safetensors",
+        None,
+        [],
+        restored_model,
+        weights_sd=state,
+    )
+    restored.apply_to([], restored_model, apply_text_encoder=False, apply_unet=True)
+    incompatible = restored.load_state_dict(state, strict=False)
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+
+
+@pytest.mark.parametrize("network_module", [loha, lokr])
+def test_anima_lycoris_resume_restores_loraplus_ratio(network_module):
+    source_model = _tiny_anima().requires_grad_(False)
+    source = network_module.create_network(1.0, 4, 4.0, None, [], source_model)
+    source.apply_to([], source_model, apply_text_encoder=False, apply_unet=True)
+
+    restored_model = _tiny_anima().requires_grad_(False)
+    restored, _ = network_module.create_network_from_weights(
+        1.0,
+        "unused.safetensors",
+        None,
+        [],
+        restored_model,
+        weights_sd=source.state_dict(),
+        loraplus_unet_lr_ratio="3.0",
+    )
+    assert restored.loraplus_unet_lr_ratio == 3.0
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"rank_dropout": 1.0}, "rank_dropout"),
+        ({"dropout": -0.1}, "dropout"),
+        ({"module_dropout": 1.1}, "module_dropout"),
+    ],
+)
+def test_anima_lora_rejects_invalid_dropout(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        lora_anima.LoRAModule("test", torch.nn.Linear(2, 2), **kwargs)
+
+
+def test_full_anima_adapters_are_not_reported_as_mergeable():
+    model = _tiny_anima().requires_grad_(False)
+    adapters = (
+        flow_map_lora_anima.create_network(1.0, 2, 2.0, None, [], model),
+        hydra_lora_anima.create_network(1.0, 2, 2.0, None, [], model),
+        chimera_lora_anima.create_network(1.0, 2, 2.0, None, [], model),
+        soft_tokens_anima.create_network(1.0, 2, 2.0, None, [], model),
+        easycontrol_anima.create_network(1.0, 2, 2.0, None, [], model),
+    )
+    assert all(adapter.is_mergeable() is False for adapter in adapters)
 
 
 def test_anima_lora_svd_down_is_zero_delta_and_uses_principal_input_basis():
@@ -475,6 +636,80 @@ def test_minimal_inference_loads_full_flow_map_adapter(tmp_path, monkeypatch):
     assert isinstance(adapter, flow_map_lora_anima.FlowMapLoRANetwork)
     assert loaded._anima_flow_map_network() is adapter
     assert adapter.multiplier == 0.75
+
+
+def test_minimal_inference_prepares_easycontrol_condition(tmp_path):
+    image_path = tmp_path / "condition.png"
+    from PIL import Image
+
+    Image.new("RGB", (48, 32), (10, 20, 30)).save(image_path)
+
+    class Adapter:
+        condition = None
+
+        def set_condition_latents(self, value):
+            self.condition = value
+
+    class VAE:
+        def to(self, *args, **kwargs):
+            return self
+
+        def encode_pixels_to_latents(self, pixels):
+            assert pixels.shape == (1, 3, 32, 64)
+            return torch.ones(1, 16, 4, 8)
+
+    adapter = Adapter()
+    args = SimpleNamespace(control_image=str(image_path), image_size=[32, 64])
+    anima_minimal_inference._prepare_easycontrol_condition(args, adapter, VAE(), torch.device("cpu"))
+    assert adapter.condition.shape == (1, 16, 4, 8)
+
+
+def test_prompt_line_supports_easycontrol_image_override():
+    parsed = anima_minimal_inference.parse_prompt_line("portrait --cn condition.png")
+    assert parsed["control_image"] == "condition.png"
+
+
+def test_minimal_inference_preserves_unicode_while_decoding_escapes():
+    assert anima_minimal_inference.process_escape("你好\\n世界") == "你好\n世界"
+    assert anima_minimal_inference.process_escape("日本語") == "日本語"
+
+
+def test_minimal_inference_default_lora_multiplier_is_optional(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "anima_minimal_inference.py",
+            "--text_encoder",
+            "unused",
+            "--save_path",
+            str(tmp_path),
+            "--prompt",
+            "test",
+            "--lora_weight",
+            "adapter.safetensors",
+        ],
+    )
+    args = anima_minimal_inference.parse_args()
+    assert args.lora_multiplier is None
+
+
+def test_decode_latent_restores_missing_batch_dimension():
+    class VAE:
+        latent_channels = 16
+        dtype = torch.float32
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def decode_to_pixels(self, latent):
+            assert latent.shape == (1, 16, 1, 4, 4)
+            return torch.zeros(1, 3, 1, 32, 32)
+
+    decoded = anima_minimal_inference.decode_latent(
+        VAE(), torch.zeros(16, 1, 4, 4), torch.device("cpu")
+    )
+    assert decoded.shape == (3, 32, 32)
 
 
 def test_anima_easycontrol_is_zero_gated_then_conditions_output(tmp_path):

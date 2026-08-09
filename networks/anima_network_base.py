@@ -66,6 +66,18 @@ def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, floa
     return pairs
 
 
+def apply_loraplus_args(network: "AdditionalNetwork", kwargs: Dict) -> None:
+    """Restore LoRA+ ratios supplied through network arguments."""
+    ratios = [
+        kwargs.get("loraplus_lr_ratio"),
+        kwargs.get("loraplus_unet_lr_ratio"),
+        kwargs.get("loraplus_text_encoder_lr_ratio"),
+    ]
+    ratios = [float(value) if value is not None else None for value in ratios]
+    if any(value is not None for value in ratios):
+        network.set_loraplus_lr_ratio(*ratios)
+
+
 class AdditionalNetwork(torch.nn.Module):
     """Generic Additional network that supports LoHa, LoKr, and similar module types.
 
@@ -99,6 +111,18 @@ class AdditionalNetwork(torch.nn.Module):
     ) -> None:
         super().__init__()
         assert module_class is not None, "module_class must be specified"
+
+        for name, value, upper_inclusive in (
+            ("dropout", dropout, True),
+            ("rank_dropout", rank_dropout, False),
+            ("module_dropout", module_dropout, True),
+        ):
+            if value is None:
+                continue
+            valid = 0.0 <= float(value) <= 1.0 if upper_inclusive else 0.0 <= float(value) < 1.0
+            if not valid:
+                interval = "[0, 1]" if upper_inclusive else "[0, 1)"
+                raise ValueError(f"{name} must be in {interval}, got {value}")
 
         self.multiplier = multiplier
         self.lora_dim = lora_dim
@@ -181,7 +205,7 @@ class AdditionalNetwork(torch.nn.Module):
                             if modules_dim is not None:
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
-                                    alpha_val = modules_alpha[lora_name]
+                                    alpha_val = modules_alpha.get(lora_name, dim)
                             else:
                                 if self.reg_dims is not None:
                                     for reg, d in self.reg_dims.items():

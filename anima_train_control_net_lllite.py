@@ -470,7 +470,13 @@ def train(args):
     # DiT (frozen)
     logger.info("Loading Anima DiT...")
     dit = anima_utils.load_anima_model(
-        "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
+        "cpu",
+        args.pretrained_model_name_or_path,
+        args.attn_mode,
+        args.split_attn,
+        "cpu",
+        dit_weight_dtype=None,
+        llm_adapter_path=args.llm_adapter_path,
     )
 
     if args.gradient_checkpointing:
@@ -818,15 +824,13 @@ def train(args):
                 huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
                 loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])
-
-                if weighting is not None:
-                    loss = loss * weighting
-
-                loss_weights = batch["loss_weights"]
-                loss = loss * loss_weights
-                loss = loss.mean()
+                    if args.masked_loss and batch.get("alpha_masks") is None:
+                        raise ValueError(
+                            "ControlNet-LLLite conditioning images are control inputs, not loss masks; "
+                            "enable alpha_mask on the training images when using --masked_loss"
+                        )
+                    loss = apply_masked_loss(loss, batch, conditioning_image_is_mask=False)
+                loss = loss_util.reduce_weighted_loss(loss, weighting, batch["loss_weights"]).mean()
 
                 try:
                     accelerator.backward(loss)
