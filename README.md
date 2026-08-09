@@ -79,6 +79,8 @@ encoder outputs are cached.
 
 ## Documentation
 
+- [`remi` branch feature and parameter overview](docs/remi_branch_features.md)
+- [Latest Anima character/style LoRA research](docs/anima_lora_training_latest_research.md)
 - [Anima LoRA training](docs/anima_train_network.md)
 - [Anima-specific optimization and experimental training](docs/anima_advanced_training.md)
 - [Anima full fine-tuning and common options](anima_train.py)
