@@ -29,7 +29,7 @@ num_repeats = 8
 
 マスク画像は、学習画像と同じサイズで、学習する部分を白、無視する部分を黒で描画します。グレースケールにも対応しています（127 ならロス重みが 0.5 になります）。なお、正確にはマスク画像の R チャネルが用いられます。
 
-DreamBooth 方式の dataset で、`conditioning_data_dir` で指定したディレクトリにマスク画像を保存してください。ControlNet のデータセットと同じですので、詳細は [ControlNet-LLLite](train_lllite_README-ja.md#データセットの準備) を参照してください。
+DreamBooth 方式の dataset を使用し、`conditioning_data_dir` で指定したディレクトリに学習画像と同じ basename のマスク画像を保存してください。ペアディレクトリの構成は [Anima ControlNet-LLLite データセット](anima_train_control_net_lllite.md#2-preparation--準備) と同じです。
 
 ### 透明度（アルファチャネル）を使用する方法
 

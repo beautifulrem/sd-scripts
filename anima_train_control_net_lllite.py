@@ -7,7 +7,6 @@ import gc
 import math
 import os
 from multiprocessing import Value
-from typing import Optional
 
 # bucket 切替で発生しうる稀な断片化 OOM 対策
 # torch import より前に環境変数を設定する必要があるため、ここで setdefault しておく.
@@ -20,9 +19,8 @@ from tqdm import tqdm
 
 import torch
 
-from library import flux_train_utils, qwen_image_autoencoder_kl
+from library import anima_flow_matching, anima_prompt_utils
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 init_ipex()
 
@@ -33,24 +31,22 @@ from library import (
     anima_utils,
     strategy_base,
     strategy_anima,
-    sai_model_spec,
+    anima_model_spec,
 )
 import library.accelerator_setup as accelerator_setup
-import library.args as args_util
+import library.anima_args as args_util
 import library.compile_utils as compile_utils
 import library.dataset as dataset_util
-import library.model_io as model_io
+import library.anima_model_io as model_io
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
-import library.loss as loss_util
+import library.anima_loss as loss_util
 import library.checkpoint_io as checkpoint_io
-import library.sampling as sampling
 import library.config_util as config_util
 from library.config_util import ConfigSanitizer, BlueprintGenerator
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
+from library.anima_loss import apply_masked_loss
 from library.utils import setup_logging, add_logging_arguments
 
-import networks.control_net_lllite_anima as lllite_module
 from networks.control_net_lllite_anima import (
     ControlNetLLLiteDiT,
     AnimaControlNetLLLiteWrapper,
@@ -285,7 +281,7 @@ def train(args):
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
-    flux_train_utils.log_timestep_sampling_info(args)
+    anima_flow_matching.log_timestep_sampling_info(args)
 
     if not args.skip_cache_check:
         args.skip_cache_check = args.skip_latents_validity_check
@@ -440,7 +436,7 @@ def train(args):
 
         if args.sample_prompts is not None:
             logger.info(f"Cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
-            prompts = sampling.load_prompts(args.sample_prompts)
+            prompts = anima_prompt_utils.load_prompts(args.sample_prompts)
             sample_prompts_te_outputs = {}
             with accelerator.autocast(), torch.no_grad():
                 for prompt_dict in prompts:
@@ -620,7 +616,9 @@ def train(args):
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
 
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
+    noise_scheduler = anima_flow_matching.AnimaFlowMatchScheduler(
+        num_train_timesteps=1000, shift=args.discrete_flow_shift
+    )
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
     if accelerator.is_main_process:
@@ -663,9 +661,7 @@ def train(args):
 
     # save helper (LLLite のみ)
     def _save_lllite(ckpt_file: str):
-        sai_metadata = model_io.get_sai_model_spec_dataclass(
-            None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
-        ).to_metadata_dict()
+        sai_metadata = model_io.get_anima_model_spec_dataclass(args, lora=False).to_metadata_dict()
         sai_metadata["modelspec.architecture"] = "anima-preview/control-net-lllite"
         sai_metadata["lllite.version"] = LLLITE_ARCH_VERSION
         sai_metadata["lllite.cond_emb_dim"] = str(args.cond_emb_dim)
@@ -772,7 +768,7 @@ def train(args):
 
                 # noise + timesteps
                 noise = torch.randn_like(latents)
-                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                noisy_model_input, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
                     args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
                 )
                 timesteps = timesteps / 1000.0
@@ -819,7 +815,7 @@ def train(args):
                 weighting = anima_train_utils.compute_loss_weighting_for_anima(
                     weighting_scheme=args.weighting_scheme, sigmas=sigmas
                 )
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
                 loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     loss = apply_masked_loss(loss, batch)
@@ -907,25 +903,21 @@ def train(args):
         _save_lllite(ckpt_file)
         logger.info("model saved.")
 
-    del accelerator
-
-
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    args_util.add_sd_models_arguments(parser)
+    args_util.add_anima_model_arguments(parser)
     args_util.add_dataset_arguments(parser, True, True, True)
     args_util.add_training_arguments(parser, False)
     args_util.add_masked_loss_arguments(parser)
     deepspeed_utils.add_deepspeed_arguments(parser)
-    args_util.add_sd_saving_arguments(parser)
+    args_util.add_anima_saving_arguments(parser)
     args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
-    add_custom_train_arguments(parser)
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
-    sai_model_spec.add_model_spec_arguments(parser)
+    anima_model_spec.add_model_spec_arguments(parser)
 
     parser.add_argument(
         "--cpu_offload_checkpointing",

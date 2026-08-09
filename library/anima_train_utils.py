@@ -15,8 +15,8 @@ from tqdm import tqdm
 from PIL import Image
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
-from library import anima_models, anima_utils, checkpoint_io, sampling, qwen_image_autoencoder_kl
-import library.model_io as model_io
+from library import anima_models, anima_prompt_utils, anima_utils, checkpoint_io, qwen_image_autoencoder_kl
+import library.anima_model_io as model_io
 
 init_ipex()
 
@@ -187,6 +187,37 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         + " / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32、推奨: 32）",
     )
     parser.add_argument(
+        "--fuse_qkv_projections",
+        action="store_true",
+        help="Fuse each Anima self-attention base Q/K/V and cross-attention base K/V into one projection while preserving standard q/k/v LoRA keys."
+        + " / 将Anima自注意力的基础Q/K/V以及交叉注意力的基础K/V分别合并为一次投影，同时保持标准q/k/v LoRA键不变。",
+    )
+    parser.add_argument(
+        "--activation_memory_budget",
+        type=float,
+        default=None,
+        help="Set the torch.compile activation-memory budget in [0, 1]. Lower values recompute more activations to reduce VRAM; 1 keeps the default maximum-speed plan. Requires --compile."
+        + " / 设置torch.compile的激活内存预算[0, 1]。值越小计算量越大但显存越低；1为默认最高速度计划。需要--compile。",
+    )
+    parser.add_argument(
+        "--compile_dynamic_sequence",
+        action="store_true",
+        help="Mark Anima's T/H/W token axes dynamic before each compiled block so free-fit buckets can share compiled graphs. Requires --compile."
+        + " / 在每个编译块前将Anima的T/H/W token轴标记为动态，使ffree-fit桶共享编译图。需要--compile。",
+    )
+    parser.add_argument(
+        "--compile_dynamic_sequence_min_tokens",
+        type=int,
+        default=None,
+        help="Optional lower bound for T*H*W tokens accepted by --compile_dynamic_sequence.",
+    )
+    parser.add_argument(
+        "--compile_dynamic_sequence_max_tokens",
+        type=int,
+        default=None,
+        help="Optional upper bound for T*H*W tokens accepted by --compile_dynamic_sequence.",
+    )
+    parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
         help="Allow TF32 precision on Ampere or newer GPUs (improves performance) / Ampere以降のGPUでTF32を許可する（パフォーマンス向上）",
@@ -196,6 +227,53 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Enable cuDNN benchmark mode (may improve performance) / cuDNNのベンチマークモードを有効にする（パフォーマンスが向上する可能性がある）",
     )
+    parser.add_argument(
+        "--repa_weight",
+        type=float,
+        default=0.0,
+        help="Weight of Anima relational REPA auxiliary loss using precomputed vision-feature sidecars (0 disables).",
+    )
+    parser.add_argument("--repa_layer", type=int, default=8, help="Zero-based Anima block captured for REPA.")
+    parser.add_argument(
+        "--repa_feature_suffix",
+        type=str,
+        default="_anima_pe_spatial.safetensors",
+        help="Suffix appended to each source image stem for its REPA feature sidecar.",
+    )
+    parser.add_argument("--repa_feature_key", type=str, default="image_features")
+    parser.add_argument("--repa_no_cls_token", action="store_true")
+    parser.add_argument("--repa_disable_dog", action="store_true")
+    parser.add_argument("--repa_dog_sigma_divisor", type=float, default=16.0)
+    parser.add_argument("--repa_max_tokens", type=int, default=512)
+    parser.add_argument(
+        "--repa_anneal_steps",
+        type=float,
+        default=0.0,
+        help="Disable REPA after this many optimizer steps; values in (0,1] are a fraction of max_train_steps.",
+    )
+    parser.add_argument(
+        "--self_flow_weight",
+        type=float,
+        default=0.0,
+        help="Weight of stop-gradient rectified-flow consistency loss (0 disables; enabling adds one DiT forward per batch).",
+    )
+    parser.add_argument("--self_flow_delta", type=float, default=0.05, help="Sigma transport distance for Self-Flow.")
+    parser.add_argument(
+        "--dp_dmd_weight",
+        type=float,
+        default=0.0,
+        help="DP-DMD generator distribution-matching weight (requires networks.turbo_dmd_anima; 0 disables).",
+    )
+    parser.add_argument("--dp_dmd_critic_weight", type=float, default=1.0)
+    parser.add_argument("--dp_dmd_steps", type=int, default=4, help="Student Euler steps used for DP-DMD rollout.")
+    parser.add_argument(
+        "--anyflow_weight",
+        type=float,
+        default=0.0,
+        help="Arbitrary-interval flow-map distillation weight (requires networks.flow_map_lora_anima).",
+    )
+    parser.add_argument("--anyflow_teacher_steps", type=int, default=4)
+    parser.add_argument("--anyflow_min_interval", type=float, default=0.05)
 
 
 def load_qwen_image_vae(args, device="cpu", disable_mmap: bool = True):
@@ -228,7 +306,7 @@ def load_qwen_image_vae(args, device="cpu", disable_mmap: bool = True):
 def compute_loss_weighting_for_anima(weighting_scheme: str, sigmas: torch.Tensor) -> torch.Tensor:
     """Compute loss weighting for Anima training.
 
-    Same schemes as SD3 but can add Anima-specific ones if needed in future.
+    Loss-weighting schemes supported by Anima flow matching.
     """
     if weighting_scheme == "sigma_sqrt":
         weighting = (sigmas**-2.0).float()
@@ -245,23 +323,23 @@ def compute_loss_weighting_for_anima(weighting_scheme: str, sigmas: torch.Tensor
 def show_timesteps(args):
     """Visualize the actual sampled-timestep / loss-weighting distribution for the current Anima settings, then return.
 
-    Anima reuses ``flux_train_utils.get_noisy_model_input_and_timesteps`` for sampling but has its own loss weighting.
+    Anima uses its dedicated flow-matching sampler and loss weighting.
     """
-    from library import flux_train_utils, sd3_train_utils, timestep_visualization
+    from library import anima_flow_matching, timestep_visualization
 
     num_train_timesteps = 1000
-    noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(
+    noise_scheduler = anima_flow_matching.AnimaFlowMatchScheduler(
         num_train_timesteps=num_train_timesteps, shift=args.discrete_flow_shift
     )
-    h, w = flux_train_utils.parse_show_timesteps_latent_size(args)  # latent size for the assumed image resolution
+    h, w = anima_flow_matching.parse_show_timesteps_latent_size(args)
     device, dtype = device_utils.get_preferred_device(), torch.float32
-    offset, offset_note = flux_train_utils.get_show_timesteps_offset(args)
+    offset, offset_note = anima_flow_matching.get_show_timesteps_offset(args)
 
     def sample_timesteps(bsz):
         latents = torch.zeros(bsz, 16, h, w, dtype=dtype, device=device)
         noise = torch.ones_like(latents)
         tso = None if offset is None else torch.full((bsz,), offset, dtype=dtype, device=device)
-        _, timesteps, _ = flux_train_utils.get_noisy_model_input_and_timesteps(
+        _, timesteps, _ = anima_flow_matching.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, device, dtype, timestep_sampling_offset=tso
         )
         return timesteps
@@ -272,7 +350,7 @@ def show_timesteps(args):
 
     header = (
         "Timestep distribution / タイムステップ分布:\n  "
-        + flux_train_utils.get_timestep_sampling_info(args)
+        + anima_flow_matching.get_timestep_sampling_info(args)
         + offset_note
         + f", resolution={args.show_timesteps_resolution} (latent {h}x{w})"
     )
@@ -381,14 +459,12 @@ def save_anima_model_on_train_end(
     """Save Anima model at the end of training."""
 
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = model_io.get_sai_model_spec_dataclass(
-            None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
-        ).to_metadata_dict()
+        sai_metadata = model_io.get_anima_model_spec_dataclass(args, lora=False).to_metadata_dict()
         dit_sd = dit.state_dict()
         # Save with 'net.' prefix for ComfyUI compatibility
         anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
 
-    checkpoint_io.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
+    checkpoint_io.save_anima_model_on_train_end(args, epoch, global_step, sd_saver)
 
 
 def save_anima_model_on_epoch_end_or_stepwise(
@@ -404,23 +480,18 @@ def save_anima_model_on_epoch_end_or_stepwise(
     """Save Anima model at epoch end or specific steps."""
 
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = model_io.get_sai_model_spec_dataclass(
-            None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
-        ).to_metadata_dict()
+        sai_metadata = model_io.get_anima_model_spec_dataclass(args, lora=False).to_metadata_dict()
         dit_sd = dit.state_dict()
         anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
 
-    checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
+    checkpoint_io.save_anima_model_on_epoch_end_or_stepwise(
         args,
         on_epoch_end,
         accelerator,
-        True,
-        True,
         epoch,
         num_train_epochs,
         global_step,
         sd_saver,
-        None,
     )
 
 
@@ -484,18 +555,34 @@ def do_sample(
     for i in tqdm(range(steps), desc="Sampling"):
         sigma = sigmas[i]
         t = sigma.unsqueeze(0)  # (1,)
+        adapter_ref = getattr(dit, "_anima_adapter_network", None)
+        adapter = adapter_ref() if adapter_ref is not None else None
+        if adapter is not None and hasattr(adapter, "set_step_sigmas"):
+            adapter.set_step_sigmas(t)
+        if adapter is not None and hasattr(adapter, "set_frequency_context"):
+            adapter.set_frequency_context(t, x)
+        if adapter is not None and hasattr(adapter, "set_flow_interval"):
+            adapter.set_flow_interval(t, sigmas[i + 1].unsqueeze(0))
 
-        if use_cfg:
-            # CFG: two separate passes to reduce memory usage
-            pos_out = dit(x, t, crossattn_emb, padding_mask=padding_mask)
-            pos_out = pos_out.float()
-            neg_out = dit(x, t, neg_crossattn_emb, padding_mask=padding_mask)
-            neg_out = neg_out.float()
+        try:
+            if use_cfg:
+                # CFG: two separate passes to reduce memory usage
+                pos_out = dit(x, t, crossattn_emb, padding_mask=padding_mask)
+                pos_out = pos_out.float()
+                neg_out = dit(x, t, neg_crossattn_emb, padding_mask=padding_mask)
+                neg_out = neg_out.float()
 
-            model_output = neg_out + guidance_scale * (pos_out - neg_out)
-        else:
-            model_output = dit(x, t, crossattn_emb, padding_mask=padding_mask)
-            model_output = model_output.float()
+                model_output = neg_out + guidance_scale * (pos_out - neg_out)
+            else:
+                model_output = dit(x, t, crossattn_emb, padding_mask=padding_mask)
+                model_output = model_output.float()
+        finally:
+            if adapter is not None and hasattr(adapter, "clear_step_sigmas"):
+                adapter.clear_step_sigmas()
+            if adapter is not None and hasattr(adapter, "clear_frequency_context"):
+                adapter.clear_frequency_context()
+            if adapter is not None and hasattr(adapter, "clear_flow_interval"):
+                adapter.clear_flow_interval()
 
         # Euler step: x_{t-1} = x_t - (sigma_t - sigma_{t-1}) * model_output
         dt = sigmas[i + 1] - sigma
@@ -556,15 +643,20 @@ def sample_images(
 
     distributed_state = PartialState()  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
 
-    prompts = sampling.load_prompts(args.sample_prompts)
+    prompts = anima_prompt_utils.load_prompts(args.sample_prompts)
     save_dir = os.path.join(args.output_dir, "sample")
     os.makedirs(save_dir, exist_ok=True)
 
     # Save RNG state
     rng_state = torch.get_rng_state()
-    cuda_rng_state = None
+    device_rng_state = None
     try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        if accelerator.device.type == "cuda":
+            device_rng_state = torch.cuda.get_rng_state(accelerator.device)
+        elif accelerator.device.type == "xpu":
+            device_rng_state = torch.xpu.get_rng_state(accelerator.device)
+        elif accelerator.device.type == "mps":
+            device_rng_state = torch.mps.get_rng_state()
     except Exception:
         pass
 
@@ -609,8 +701,13 @@ def sample_images(
 
     # Restore RNG state
     torch.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+    if device_rng_state is not None:
+        if accelerator.device.type == "cuda":
+            torch.cuda.set_rng_state(device_rng_state, accelerator.device)
+        elif accelerator.device.type == "xpu":
+            torch.xpu.set_rng_state(device_rng_state, accelerator.device)
+        elif accelerator.device.type == "mps":
+            torch.mps.set_rng_state(device_rng_state)
 
     dit.switch_block_swap_for_training()
     clean_memory_on_device(accelerator.device)

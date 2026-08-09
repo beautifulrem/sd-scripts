@@ -2,9 +2,9 @@
 
 This document explains how to train a **ControlNet-LLLite** for Anima using `anima_train_control_net_lllite.py`, and how to run minimal inference with the trained weights via `anima_minimal_inference_control_net_lllite.py`.
 
-ControlNet-LLLite is a lightweight, LoRA-like conditional control module originally introduced for SDXL (see [`train_lllite_README.md`](./train_lllite_README.md)). This Anima port retargets it to the DiT (MiniTrainDIT) architecture used by Anima: small adapter modules are attached to selected `Linear` layers of each transformer block, and a shared conditioning-image embedding (`conditioning1`) is broadcast to all of them.
+ControlNet-LLLite is a lightweight, LoRA-like conditional control module. This Anima port targets the DiT (MiniTrainDIT) architecture: small adapter modules are attached to selected `Linear` layers of each transformer block, and a shared conditioning-image embedding (`conditioning1`) is broadcast to all of them.
 
-The current implementation is the **v2 architecture**, which extends the original LLLite (SDXL version) with:
+The current implementation is the **v2 architecture**, adapted specifically for Anima with:
 
 * a deeper `conditioning1` trunk (Conv stride-4 ×2 + Conv stride-1 + GroupNorm + SiLU + ResBlocks + final `LayerNorm`) so that the shared conditioning embedding has a wider receptive field,
 * **FiLM (γ, β)** modulation inside each LLLite module on top of the original concat-then-mid path, zero-initialized so the module starts from identity,
@@ -21,9 +21,9 @@ An experimental ComfyUI ControlNet-LLLite node for Anima is also available [here
 
 このドキュメントでは、`sd-scripts` リポジトリに含まれる `anima_train_control_net_lllite.py` を用いて Anima モデル向けの **ControlNet-LLLite** を学習する手順、および学習した重みを `anima_minimal_inference_control_net_lllite.py` で推論する基本的な手順について解説します。
 
-ControlNet-LLLite は SDXL 向けに導入された LoRA ライクな軽量条件付け手法です（オリジナルの解説は [`train_lllite_README-ja.md`](./train_lllite_README-ja.md) を参照）。Anima 版では、Anima が採用する DiT (MiniTrainDIT) アーキテクチャに移植してあり、各 Transformer ブロックの選択した `Linear` レイヤに小さな adapter を貼り、conditioning 画像を埋め込んだ単一の `conditioning1` を全モジュールに配布する構成になっています。
+ControlNet-LLLite は LoRA ライクな軽量条件付け手法です。Anima 版では、Anima が採用する DiT (MiniTrainDIT) アーキテクチャを対象とし、各 Transformer ブロックの選択した `Linear` レイヤに小さな adapter を貼り、conditioning 画像を埋め込んだ単一の `conditioning1` を全モジュールに配布します。
 
-現在の実装は **v2 アーキテクチャ**で、初期実装（SDXL版LLLite）に対して以下を拡張しています：
+現在の実装は **v2 アーキテクチャ**で、Anima 向けに以下を実装しています：
 
 * `conditioning1` を深層化（Conv stride-4 ×2 + Conv stride-1 + GroupNorm + SiLU + ResBlock + 末尾 `LayerNorm`）し、shared conditioning 埋め込みの受容野を広げています。
 * 各 LLLite モジュール内で、従来の concat→mid 経路に加えて **FiLM (γ, β)** による変調を導入。zero-init で identity から学習開始します。
@@ -49,7 +49,7 @@ ControlNet-LLLite は SDXL 向けに導入された LoRA ライクな軽量条�
 | Extra inputs at train step | — | `conditioning_images` from each batch |
 | Saved weights | LoRA `.safetensors` | LLLite `.safetensors` (`lllite_conditioning1.*` + per-module `{lllite_name}.*`, e.g. `lllite_dit_blocks_0_self_attn_q_proj.*`) |
 
-The dataset format is the same as the existing SDXL ControlNet-LLLite script. See the **Preparing the dataset** section of [`train_lllite_README.md`](./train_lllite_README.md#preparing-the-dataset) ([日本語](./train_lllite_README-ja.md#データセットの準備)) for the directory layout, `conditioning_data_dir`, and dataset synthesis tips.
+The required paired-image layout and `conditioning_data_dir` setting are described in Sections 2 and 3 below.
 
 <details>
 <summary>日本語</summary>
@@ -64,7 +64,7 @@ The dataset format is the same as the existing SDXL ControlNet-LLLite script. Se
 | 学習ステップの追加入力 | — | バッチ内の `conditioning_images` |
 | 保存される重み | LoRA `.safetensors` | LLLite `.safetensors`（`lllite_conditioning1.*` と モジュール毎の `{lllite_name}.*`、例：`lllite_dit_blocks_0_self_attn_q_proj.*`） |
 
-データセット形式は既存の SDXL 向け ControlNet-LLLite と同一です。ディレクトリ構成、`conditioning_data_dir` の指定、データセット合成のヒントなどは [`train_lllite_README-ja.md`](./train_lllite_README-ja.md#データセットの準備) を参照してください。
+必要な画像ペアの配置と `conditioning_data_dir` の指定は、後述のセクション 2 と 3 を参照してください。
 
 </details>
 
@@ -138,14 +138,14 @@ batch_size = 1
   num_repeats = 1
 ```
 
-For a fuller description of dataset options, see the SDXL LLLite guide ([English](./train_lllite_README.md#preparing-the-dataset) / [日本語](./train_lllite_README-ja.md#データセットの準備)) and the [Dataset Configuration Guide](./config_README-en.md). The dataset format and the meaning of `conditioning_data_dir` are identical to the SDXL version.
+For all other dataset options, see the [Dataset Configuration Guide](./config_README-en.md). Training images and conditioning images must use matching basenames; conditioning images do not need caption files and are resized to the training image size.
 
 <details>
 <summary>日本語</summary>
 
 学習の実行コマンド例は英語側を参照してください（実際は1行で書くか、Linux/macOS では `\`、Windows では `^` で改行してください）。
 
-ControlNet 形式のデータセット TOML の最小例も英語側にある通りで、`conditioning_data_dir` の指定が SDXL LLLite と同一です。データセット設定の詳細については SDXL LLLite ガイド（[`train_lllite_README-ja.md`](./train_lllite_README-ja.md#データセットの準備)）と [データセット設定ガイド](./config_README-ja.md) を参照してください。
+ControlNet 形式の最小 TOML は英語側の例を参照してください。教師画像と conditioning 画像は同じ basename にし、conditioning 画像側には caption ファイルは不要です。その他の設定は [データセット設定ガイド](./config_README-ja.md) を参照してください。
 
 </details>
 
@@ -232,7 +232,7 @@ A reasonable starting point for lineart-style control on Anima is the v2 default
 * `--lllite_cond_resblocks=1`
 * `--lllite_mlp_dim=64`
 * `--lllite_target_layers=self_attn_q`
-* `--learning_rate=1e-4` (roughly half of the SDXL LLLite default; AdaLN-conditioned DiTs tend to be more sensitive to additive bias)
+* `--learning_rate=1e-4` (AdaLN-conditioned DiTs tend to be sensitive to additive bias)
 * `--optimizer_type=AdamW8bit`
 * `--mixed_precision=bf16`
 * `--gradient_checkpointing`, `--cache_latents`, `--cache_text_encoder_outputs`
@@ -260,7 +260,7 @@ These are just example starting points since the optimal hyperparameters may var
 * `--lllite_cond_resblocks=1`
 * `--lllite_mlp_dim=64`
 * `--lllite_target_layers=self_attn_q`
-* `--learning_rate=1e-4`（SDXL LLLite のデフォルトのおよそ半分。AdaLN ベースの DiT は加算成分に対する感度が高めのため）
+* `--learning_rate=1e-4`（AdaLN ベースの DiT は加算成分に対する感度が高めのため）
 * `--optimizer_type=AdamW8bit`
 * `--mixed_precision=bf16`
 * `--gradient_checkpointing`、`--cache_latents`、`--cache_text_encoder_outputs`
@@ -622,7 +622,7 @@ python anima_minimal_inference_control_net_lllite.py \
 * **Bucket size.** The training script enforces a bucket resolution step of 16 (Qwen-Image VAE /8 × patch /2).
 * **Memory.** `--blocks_to_swap`, `--cpu_offload_checkpointing`, `--unsloth_offload_checkpointing` are not yet supported. If VRAM is tight, prefer `--full_bf16`, smaller `--lllite_mlp_dim`, lower `--cond_emb_dim`, and `--gradient_checkpointing`.
 * **`torch.compile` (speed-up).** Per-block `torch.compile` of the DiT is supported here as well, via the same `--compile` / `--compile_*` arguments shared with the LoRA script. See [`anima_torch_compile.md`](./anima_torch_compile.md) for details and recommended settings. Note that with aspect-ratio bucketing each distinct bucket resolution triggers a one-time recompile, so the first pass over your buckets is slower before it settles.
-* **Save format.** The saved `.safetensors` is **not** compatible with the SDXL LLLite format and **not** loadable by `sdxl_gen_img.py`. Use the dedicated inference script in Section 6.
+* **Save format.** The saved `.safetensors` uses the Anima LLLite format. Use the dedicated inference script in Section 6.
 * **Metadata-required at inference.** Inference relies on the architecture metadata (`lllite.version`, `lllite.cond_dim`, `lllite.cond_resblocks`, `lllite.use_aspp`, `lllite.target_atomics`, ...) saved by the training script to reconstruct the LLLite architecture. State-dict-only auto-detection of those fields is not implemented; if a weight file lacks metadata, you currently need to pass the override flags listed in Section 6.3 explicitly.
 
 <details>
@@ -633,7 +633,7 @@ python anima_minimal_inference_control_net_lllite.py \
 * **bucket サイズ.** 学習スクリプトは bucket 解像度ステップを 16（Qwen-Image VAE /8 × patch /2）として検証します。
 * **メモリ.** `--blocks_to_swap`、`--cpu_offload_checkpointing`、`--unsloth_offload_checkpointing` は未対応です。VRAM が厳しい場合は `--full_bf16`、`--lllite_mlp_dim` を下げる、`--cond_emb_dim` を下げる、`--gradient_checkpointing` を有効にする、などで対応してください。
 * **`torch.compile`（高速化）.** LoRA 学習スクリプトと共通の `--compile` / `--compile_*` 引数により、本スクリプトでも DiT のブロック単位 `torch.compile` が利用できます。詳細や推奨設定は [`anima_torch_compile.md`](./anima_torch_compile.md) を参照してください。なお aspect-ratio bucketing 使用時はバケット解像度ごとに初回 1 回の recompile が走るため、全バケットを一巡するまでは遅くなりますが、その後は安定します。
-* **保存形式.** 保存される `.safetensors` は SDXL LLLite フォーマットとは**互換性がなく**、`sdxl_gen_img.py` ではロードできません。推論には第 6 節の専用スクリプトを使用してください。
+* **保存形式.** 保存される `.safetensors` は Anima LLLite 形式です。推論には第 6 節の専用スクリプトを使用してください。
 * **推論時のメタデータ依存.** 推論時のアーキテクチャ復元は、学習スクリプトが書き込んだメタデータ（`lllite.version` / `lllite.cond_dim` / `lllite.cond_resblocks` / `lllite.use_aspp` / `lllite.target_atomics` など）に依存します。state_dict 単独からの自動判定は実装されていないため、メタデータの無い重みを使う場合は第 6.3 節の手動上書き引数を明示的に指定してください。
 
 </details>

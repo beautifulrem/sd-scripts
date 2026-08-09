@@ -147,10 +147,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None)
-    parser.add_argument(
-        "--lycoris", action="store_true",
-        help=f"use lycoris{'' if ami.lycoris_available else ' (not available)'}",
-    )
 
     parser.add_argument("--from_file", type=str, default=None)
     parser.add_argument("--interactive", action="store_true")
@@ -225,9 +221,6 @@ def parse_args() -> argparse.Namespace:
                 "--control_image is required for single-prompt inference. "
                 "In --from_file mode, you may instead specify --cn per prompt."
             )
-
-    if args.lycoris and not ami.lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"

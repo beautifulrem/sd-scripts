@@ -28,7 +28,7 @@ are used as the background.
 
 import math
 import random
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -170,7 +170,6 @@ def shape_mask(
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
 
-    area = width * height
     size_w = rng.randint(int(width * min_coverage ** 0.5), int(width * max_coverage ** 0.5))
     size_h = rng.randint(int(height * min_coverage ** 0.5), int(height * max_coverage ** 0.5))
 

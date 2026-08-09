@@ -3,7 +3,7 @@ from safetensors.torch import save_file
 from safetensors import safe_open
 
 
-import library.model_io as model_io
+import library.anima_model_io as model_io
 from library.utils import setup_logging
 
 setup_logging()

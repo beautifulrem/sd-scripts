@@ -28,11 +28,10 @@ import importlib
 import logging
 import math
 import os
-import pathlib
 import random
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import cv2
 import imagesize
@@ -40,12 +39,9 @@ import numpy as np
 import torch
 from PIL import Image
 from accelerate import Accelerator
-from diffusers import AutoencoderKL
 from torchvision import transforms
 from tqdm import tqdm
-from transformers import CLIPTokenizer
 
-import library.model_util as model_util
 from library import accelerator_setup
 from library.device_utils import clean_memory_on_device
 from library.strategy_base import (
@@ -54,9 +50,12 @@ from library.strategy_base import (
     TextEncodingStrategy,
     TokenizeStrategy,
 )
+
+if TYPE_CHECKING:
+    from library.dreambooth_dataset import DreamBoothDataset
+    from library.finetuning_dataset import FineTuningDataset
 from library.subset import (
     BaseSubset,
-    ControlNetSubset,
     DreamBoothSubset,
     FineTuningSubset,
 )
@@ -77,7 +76,7 @@ logger = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
 try:
-    import pillow_avif
+    import pillow_avif  # noqa: F401 -- registers the Pillow AVIF plugin
 
     IMAGE_EXTENSIONS.extend([".avif", ".AVIF"])
 except:
@@ -85,7 +84,7 @@ except:
 
 # JPEG-XL on Linux
 try:
-    from jxlpy import JXLImagePlugin
+    from jxlpy import JXLImagePlugin  # noqa: F401 -- registers the Pillow JPEG-XL plugin
     from library.jpeg_xl_util import get_jxl_size
 
     IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
@@ -94,7 +93,7 @@ except:
 
 # JPEG-XL on Linux and Windows
 try:
-    import pillow_jxl
+    import pillow_jxl  # noqa: F401 -- registers the Pillow JPEG-XL plugin
     from library.jpeg_xl_util import get_jxl_size
 
     IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
@@ -102,7 +101,25 @@ except:
     pass
 
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
-TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX_SD3 = "_sd3_te.npz"
+
+def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64):
+    """Build the aspect-ratio bucket sizes used by Anima datasets."""
+
+    max_width, max_height = max_reso
+    max_area = max_width * max_height
+    resolutions = set()
+    square_size = int(math.sqrt(max_area) // divisible) * divisible
+    resolutions.add((square_size, square_size))
+
+    width = min_size
+    while width <= max_size:
+        height = min(max_size, int((max_area // width) // divisible) * divisible)
+        if height >= min_size:
+            resolutions.add((width, height))
+            resolutions.add((height, width))
+        width += divisible
+    return sorted(resolutions)
+
 
 def split_train_val(
     paths: List[str],
@@ -179,7 +196,7 @@ class ImageInfo:
 
 
 class BucketManager:
-    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps) -> None:
+    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps, free_fit=False) -> None:
         if max_size is not None:
             if max_reso is not None:
                 assert max_size >= max_reso[0], "the max_size should be larger than the width of max_reso"
@@ -188,6 +205,9 @@ class BucketManager:
                 assert max_size >= min_size, "the max_size should be larger than the min_size"
 
         self.no_upscale = no_upscale
+        self.free_fit = free_fit
+        if self.no_upscale and self.free_fit:
+            raise ValueError("bucket_no_upscale and bucket_free_fit are mutually exclusive")
         if max_reso is None:
             self.max_reso = None
             self.max_area = None
@@ -227,7 +247,7 @@ class BucketManager:
         self.reso_to_id = sorted_reso_to_id
 
     def make_buckets(self):
-        resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
+        resos = make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
         self.set_predefined_resos(resos)
 
     def set_predefined_resos(self, resos):
@@ -250,7 +270,45 @@ class BucketManager:
 
     def select_bucket(self, image_width, image_height):
         aspect_ratio = image_width / image_height
-        if not self.no_upscale:
+        if self.free_fit:
+            # Fit the original aspect ratio to the target pixel area. Unlike
+            # no_upscale, this deliberately normalizes small and large inputs to
+            # a common compute budget. Only step rounding introduces crop.
+            target_width = math.sqrt(self.max_area * aspect_ratio)
+            target_height = self.max_area / target_width
+
+            def candidate_from_width():
+                width = max(self.reso_steps, self.round_to_steps(target_width))
+                height = max(self.reso_steps, self.round_to_steps(width / aspect_ratio))
+                return width, height
+
+            def candidate_from_height():
+                height = max(self.reso_steps, self.round_to_steps(target_height))
+                width = max(self.reso_steps, self.round_to_steps(height * aspect_ratio))
+                return width, height
+
+            candidates = [candidate_from_width(), candidate_from_height()]
+            if self.max_size is not None:
+                candidates = [(w, h) for w, h in candidates if w <= self.max_size and h <= self.max_size]
+            if not candidates:
+                scale = self.max_size / max(target_width, target_height)
+                scaled_width = target_width * scale
+                scaled_height = target_height * scale
+                candidates = [
+                    (
+                        max(self.reso_steps, self.round_to_steps(scaled_width)),
+                        max(self.reso_steps, self.round_to_steps(scaled_height)),
+                    )
+                ]
+            # Prefer aspect fidelity, then the candidate closest to target area.
+            reso = min(
+                candidates,
+                key=lambda wh: (abs(wh[0] / wh[1] - aspect_ratio), abs(wh[0] * wh[1] - self.max_area)),
+            )
+            ar_reso = reso[0] / reso[1]
+            scale = reso[1] / image_height if aspect_ratio > ar_reso else reso[0] / image_width
+            resized_size = (int(image_width * scale + 0.5), int(image_height * scale + 0.5))
+        elif not self.no_upscale:
             # 拡大および縮小を行う
             # 同じaspect ratioがあるかもしれないので（fine tuningで、no_upscale=Trueで前処理した場合）、解像度が同じものを優先する
             reso = (image_width, image_height)
@@ -389,7 +447,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_bucket_reso = None
         self.bucket_reso_steps = None
         self.bucket_no_upscale = None
+        self.bucket_free_fit = False
         self.bucket_info = None  # for metadata
+        self.repa_feature_suffix: Optional[str] = None
+        self.repa_feature_key: str = "image_features"
 
         self.current_epoch: int = 0  # インスタンスがepochごとに新しく作られるようなので外側から渡さないとダメ
 
@@ -656,10 +717,11 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.min_bucket_reso,
                     self.max_bucket_reso,
                     self.bucket_reso_steps,
+                    self.bucket_free_fit,
                 )
-                if not self.bucket_no_upscale:
+                if not self.bucket_no_upscale and not self.bucket_free_fit:
                     self.bucket_manager.make_buckets()
-                else:
+                elif self.bucket_no_upscale:
                     logger.warning(
                         "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
                     )
@@ -1003,6 +1065,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
+        repa_features = []
         masks = []
         masked_images = []
 
@@ -1011,6 +1074,23 @@ class BaseDataset(torch.utils.data.Dataset):
             subset = self.image_to_subset[image_key]
 
             custom_attributes.append(subset.custom_attributes)
+            if self.repa_feature_suffix is not None:
+                from safetensors.torch import load_file
+
+                feature_path = os.path.splitext(image_info.absolute_path)[0] + self.repa_feature_suffix
+                if not os.path.isfile(feature_path):
+                    raise FileNotFoundError(f"REPA feature sidecar missing: {feature_path}")
+                feature_dict = load_file(feature_path)
+                if self.repa_feature_key not in feature_dict:
+                    raise KeyError(f"REPA sidecar {feature_path} has no key {self.repa_feature_key!r}")
+                cached_bucket_size = feature_dict.get("anima_bucket_size")
+                if cached_bucket_size is not None and tuple(cached_bucket_size.tolist()) != tuple(image_info.bucket_reso):
+                    raise ValueError(
+                        f"REPA sidecar {feature_path} was cached for bucket {tuple(cached_bucket_size.tolist())}, "
+                        f"but training selected {tuple(image_info.bucket_reso)}; regenerate it with matching "
+                        "target_pixels, resolution_step and max_bucket_reso"
+                    )
+                repa_features.append(feature_dict[self.repa_feature_key].float())
 
             # in case of fine tuning, is_reg is always False
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
@@ -1196,6 +1276,7 @@ class BaseDataset(torch.utils.data.Dataset):
         # set example
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
+        example["repa_features"] = torch.stack(repa_features) if repa_features else None
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
@@ -1321,6 +1402,22 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def verify_bucket_reso_steps(self, min_steps: int):
         for dataset in self.datasets:
             dataset.verify_bucket_reso_steps(min_steps)
+
+    def enable_repa_features(self, suffix: str, key: str = "image_features") -> None:
+        for dataset in self.datasets:
+            if hasattr(dataset, "enable_repa_features"):
+                dataset.enable_repa_features(suffix, key)
+            else:
+                dataset.repa_feature_suffix = suffix
+                dataset.repa_feature_key = key
+
+    def is_repa_feature_compatible(self) -> bool:
+        return all(
+            dataset.is_repa_feature_compatible()
+            if hasattr(dataset, "is_repa_feature_compatible")
+            else all(not subset.flip_aug and not subset.color_aug and not subset.random_crop for subset in dataset.subsets)
+            for dataset in self.datasets
+        )
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
         return [(dataset.width, dataset.height) for dataset in self.datasets]
@@ -1545,7 +1642,7 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
     dataset_class = args.dataset_class.split(".")[-1]
     module = importlib.import_module(module)
     dataset_class = getattr(module, dataset_class)
-    train_dataset_group: MinimalDataset = dataset_class(tokenizer, args.max_token_length, args.resolution, args.debug_dataset)
+    train_dataset_group: MinimalDataset = dataset_class(tokenizer, None, args.resolution, args.debug_dataset)
     return train_dataset_group
 
 

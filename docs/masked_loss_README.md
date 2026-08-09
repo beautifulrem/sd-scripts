@@ -28,7 +28,7 @@ num_repeats = 8
 
 The mask image is the same size as the training image, with the part to be trained drawn in white and the part to be ignored in black. It also supports grayscale (127 gives a loss weight of 0.5). The R channel of the mask image is used currently.
 
-Use the dataset in the DreamBooth method, and save the mask image in the directory specified by `conditioning_data_dir`. It is the same as the ControlNet dataset, so please refer to [ControlNet-LLLite](train_lllite_README.md#Preparing-the-dataset) for details.
+Use a DreamBooth-style dataset and save mask images in the directory specified by `conditioning_data_dir`. Mask images must use the same basenames as their training images; the paired-directory layout matches the [Anima ControlNet-LLLite dataset](anima_train_control_net_lllite.md#2-preparation--準備).
 
 ### Using transparency (alpha channel) of the image
 

@@ -22,10 +22,9 @@ from voluptuous import (
     Required,
     Schema,
 )
-from transformers import CLIPTokenizer
 
 from . import accelerator_setup
-from . import args as args_util
+from . import anima_args as args_util
 from .subset import (
     DreamBoothSubset,
     FineTuningSubset,
@@ -120,6 +119,7 @@ class DreamBoothDatasetParams(BaseDatasetParams):
     max_bucket_reso: int = 1024
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
+    bucket_free_fit: bool = False
     prior_loss_weight: float = 1.0
 
 @dataclass
@@ -130,6 +130,7 @@ class FineTuningDatasetParams(BaseDatasetParams):
     max_bucket_reso: int = 1024
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
+    bucket_free_fit: bool = False
 
 
 @dataclass
@@ -140,6 +141,7 @@ class ControlNetDatasetParams(BaseDatasetParams):
     max_bucket_reso: int = 1024
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
+    bucket_free_fit: bool = False
 
 
 @dataclass
@@ -238,6 +240,7 @@ class ConfigSanitizer:
     DATASET_ASCENDABLE_SCHEMA = {
         "batch_size": int,
         "bucket_no_upscale": bool,
+        "bucket_free_fit": bool,
         "bucket_reso_steps": int,
         "enable_bucket": bool,
         "max_bucket_reso": int,
@@ -545,6 +548,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                   max_bucket_reso: {dataset.max_bucket_reso}
                   bucket_reso_steps: {dataset.bucket_reso_steps}
                   bucket_no_upscale: {dataset.bucket_no_upscale}
+                  bucket_free_fit: {dataset.bucket_free_fit}
                 \n"""), "  ")
             else:
                 info += "\n"
@@ -616,7 +620,7 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
         tokens = name.split("_")
         try:
             n_repeats = int(tokens[0])
-        except ValueError as e:
+        except ValueError:
             logger.warning(f"ignore directory without repeats / 繰り返し回数のないディレクトリを無視します: {name}")
             return 0, ""
         caption_by_folder = "_".join(tokens[1:])

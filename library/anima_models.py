@@ -66,10 +66,7 @@ except ImportError:
                 out.append(x)
             return tuple(out)
         else:
-            raise RuntimeError(
-                "Only tuple of tensors is supported. Got Unsupported input type: ",
-                type(inputs).__name__,
-            )
+            raise TypeError(f"only tuple inputs are supported, got {type(inputs).__name__}")
 
 
 class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
@@ -84,6 +81,12 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
     def forward(ctx, forward_function, hidden_states, *args):
         # Remember the original device for backward pass (multi-GPU support)
         ctx.input_device = hidden_states.device
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.device_rng_state = None
+        if hidden_states.device.type == "cuda":
+            ctx.device_rng_state = torch.cuda.get_rng_state(hidden_states.device)
+        elif hidden_states.device.type == "xpu":
+            ctx.device_rng_state = torch.xpu.get_rng_state(hidden_states.device)
         saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
         with torch.no_grad():
             output = forward_function(hidden_states, *args)
@@ -103,8 +106,24 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
         hidden_states.requires_grad_(True)
         args = detach_variable(ctx.args)
         inputs = (hidden_states,) + args
-        with torch.enable_grad():
-            outputs = ctx.forward_function(*inputs)
+        current_cpu_rng_state = torch.get_rng_state()
+        current_device_rng_state = None
+        if ctx.input_device.type == "cuda":
+            current_device_rng_state = torch.cuda.get_rng_state(ctx.input_device)
+            torch.cuda.set_rng_state(ctx.device_rng_state, ctx.input_device)
+        elif ctx.input_device.type == "xpu":
+            current_device_rng_state = torch.xpu.get_rng_state(ctx.input_device)
+            torch.xpu.set_rng_state(ctx.device_rng_state, ctx.input_device)
+        torch.set_rng_state(ctx.cpu_rng_state)
+        try:
+            with torch.enable_grad():
+                outputs = ctx.forward_function(*inputs)
+        finally:
+            torch.set_rng_state(current_cpu_rng_state)
+            if ctx.input_device.type == "cuda":
+                torch.cuda.set_rng_state(current_device_rng_state, ctx.input_device)
+            elif ctx.input_device.type == "xpu":
+                torch.xpu.set_rng_state(current_device_rng_state, ctx.input_device)
 
         output_tensors = []
         grad_tensors = []
@@ -203,11 +222,7 @@ def apply_rotary_pos_emb(
             ]
         ).squeeze(1)
 
-    if tensor_format == "sbhd":
-        seqlen = t.size(0)
-    elif tensor_format == "bshd":
-        seqlen = t.size(1)
-    else:
+    if tensor_format not in ("sbhd", "bshd"):
         raise ValueError(f"Unsupported tensor_format: {tensor_format}.")
     return _apply_rotary_pos_emb_base(
         t,
@@ -313,6 +328,7 @@ class Attention(nn.Module):
         self._context_dim = context_dim
         self._inner_dim = inner_dim
         self.init_weights()
+        self._projection_fusion_enabled = False
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self._query_dim)
@@ -334,10 +350,21 @@ class Attention(nn.Module):
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
     ) -> tuple:
-        q = self.q_proj(x)
         context = x if context is None else context
-        k = self.k_proj(context)
-        v = self.v_proj(context)
+        if self._projection_fusion_enabled and self.is_selfattn:
+            q, k, v = self._fused_base_projection(x, (self.q_proj, self.k_proj, self.v_proj)).chunk(3, dim=-1)
+            q = q + self._adapter_delta(self.q_proj, x)
+            k = k + self._adapter_delta(self.k_proj, x)
+            v = v + self._adapter_delta(self.v_proj, x)
+        elif self._projection_fusion_enabled:
+            q = self.q_proj(x)
+            k, v = self._fused_base_projection(context, (self.k_proj, self.v_proj)).chunk(2, dim=-1)
+            k = k + self._adapter_delta(self.k_proj, context)
+            v = v + self._adapter_delta(self.v_proj, context)
+        else:
+            q = self.q_proj(x)
+            k = self.k_proj(context)
+            v = self.v_proj(context)
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
             (q, k, v),
@@ -351,6 +378,34 @@ class Attention(nn.Module):
             k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
 
         return q, k, v
+
+    @staticmethod
+    def _adapter_delta(projection: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        adapter_ref = getattr(projection, "_anima_lora_ref", None)
+        if adapter_ref is None:
+            return torch.zeros((*x.shape[:-1], projection.out_features), device=x.device, dtype=x.dtype)
+        adapter = adapter_ref()
+        if adapter is None:
+            raise RuntimeError("Anima LoRA projection adapter was released while fusion is active")
+        if not getattr(adapter, "enabled", True) or getattr(adapter, "adapter_mode", None) == "base":
+            return torch.zeros((*x.shape[:-1], projection.out_features), device=x.device, dtype=x.dtype)
+        return adapter.forward_delta(x)
+
+    @staticmethod
+    def _fused_base_projection(x: torch.Tensor, projections: tuple[nn.Linear, ...]) -> torch.Tensor:
+        # Separate parameters and state-dict keys are deliberately retained for
+        # compatibility. Inductor can hoist/fuse this cat for frozen LoRA bases.
+        weight = torch.cat([projection.weight for projection in projections], dim=0)
+        return F.linear(x, weight)
+
+    def enable_projection_fusion(self) -> bool:
+        """Fuse base self-QKV or cross-KV while preserving standard adapter keys."""
+        for projection in (self.q_proj, self.k_proj, self.v_proj):
+            owner = getattr(projection.forward, "__self__", None)
+            if owner is not projection and not hasattr(projection, "_anima_lora_ref"):
+                return False
+        self._projection_fusion_enabled = True
+        return True
 
     def forward(
         self,
@@ -371,6 +426,18 @@ class Attention(nn.Module):
         del q, k, v
         result = attention.attention(qkv, attn_params=attn_params)
         return self.output_dropout(self.output_proj(result))
+
+
+def enable_attention_projection_fusion(model: nn.Module) -> tuple[int, int]:
+    """Enable compatible Anima Attention modules, returning (enabled, skipped)."""
+    enabled = skipped = 0
+    for module in model.modules():
+        if isinstance(module, Attention):
+            if module.enable_projection_fusion():
+                enabled += 1
+            else:
+                skipped += 1
+    return enabled, skipped
 
 
 # Positional Embeddings
@@ -965,10 +1032,21 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.training and self.gradient_checkpointing:
+            checkpoint_forward = self._forward
+            provider_ref = getattr(self, "_anima_adapter_context_provider", None)
+            provider = provider_ref() if provider_ref is not None else None
+            if provider is not None and hasattr(provider, "capture_recompute_context"):
+                adapter_snapshot = provider.capture_recompute_context()
+                if adapter_snapshot is not None:
+
+                    def checkpoint_forward(*inputs):
+                        with provider.use_recompute_context(adapter_snapshot):
+                            return self._forward(*inputs)
+
             if self.unsloth_offload_checkpointing:
                 # Unsloth: async non-blocking CPU RAM offload (fastest offload method)
                 return unsloth_checkpoint(
-                    self._forward,
+                    checkpoint_forward,
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -991,7 +1069,7 @@ class Block(nn.Module):
                     return custom_forward
 
                 return torch_checkpoint(
-                    create_custom_forward(self._forward),
+                    create_custom_forward(checkpoint_forward),
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -1005,7 +1083,7 @@ class Block(nn.Module):
             else:
                 # Standard gradient checkpointing (no offload)
                 return torch_checkpoint(
-                    self._forward,
+                    checkpoint_forward,
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -1614,58 +1692,3 @@ class LLMAdapter(nn.Module):
                 position_embeddings_context=position_embeddings_context,
             )
         return self.norm(self.out_proj(x))
-
-
-# Not used currently, but kept for reference
-
-# def get_dit_config(state_dict, key_prefix=""):
-#     """Derive DiT configuration from state_dict weight shapes."""
-#     dit_config = {}
-#     dit_config["max_img_h"] = 512
-#     dit_config["max_img_w"] = 512
-#     dit_config["max_frames"] = 128
-#     concat_padding_mask = True
-#     dit_config["in_channels"] = (state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[1] // 4) - int(
-#         concat_padding_mask
-#     )
-#     dit_config["out_channels"] = 16
-#     dit_config["patch_spatial"] = 2
-#     dit_config["patch_temporal"] = 1
-#     dit_config["model_channels"] = state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[0]
-#     dit_config["concat_padding_mask"] = concat_padding_mask
-#     dit_config["crossattn_emb_channels"] = 1024
-#     dit_config["pos_emb_cls"] = "rope3d"
-#     dit_config["pos_emb_learnable"] = True
-#     dit_config["pos_emb_interpolation"] = "crop"
-#     dit_config["min_fps"] = 1
-#     dit_config["max_fps"] = 30
-
-#     dit_config["use_adaln_lora"] = True
-#     dit_config["adaln_lora_dim"] = 256
-#     if dit_config["model_channels"] == 2048:
-#         dit_config["num_blocks"] = 28
-#         dit_config["num_heads"] = 16
-#     elif dit_config["model_channels"] == 5120:
-#         dit_config["num_blocks"] = 36
-#         dit_config["num_heads"] = 40
-#     elif dit_config["model_channels"] == 1280:
-#         dit_config["num_blocks"] = 20
-#         dit_config["num_heads"] = 20
-
-#     if dit_config["in_channels"] == 16:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 4.0
-#         dit_config["rope_w_extrapolation_ratio"] = 4.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-#     elif dit_config["in_channels"] == 17:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 3.0
-#         dit_config["rope_w_extrapolation_ratio"] = 3.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-
-#     dit_config["extra_h_extrapolation_ratio"] = 1.0
-#     dit_config["extra_w_extrapolation_ratio"] = 1.0
-#     dit_config["extra_t_extrapolation_ratio"] = 1.0
-#     dit_config["rope_enable_fps_modulation"] = False
-
-#     return dit_config

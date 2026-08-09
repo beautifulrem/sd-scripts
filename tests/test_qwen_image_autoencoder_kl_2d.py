@@ -32,8 +32,11 @@ def test_qwen_image_2d_vae_matches_single_frame_3d_vae():
         decoded_3d = vae_3d.decode(latents, return_dict=False)[0].squeeze(2)
         decoded_2d = vae_2d.decode(latents.squeeze(2), return_dict=False)[0]
 
-    assert torch.allclose(encoded_2d, encoded_3d)
-    assert torch.allclose(decoded_2d, decoded_3d, atol=1e-6)
+    # Conv2d and the equivalent single-frame Conv3d kernels can accumulate in
+    # a slightly different order on different CPU backends. The conversion is
+    # still numerically equivalent; observed discrepancies are around 1e-7.
+    assert torch.allclose(encoded_2d, encoded_3d, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(decoded_2d, decoded_3d, rtol=1e-5, atol=1e-6)
 
 
 def test_qwen_image_2d_state_dict_conversion_drops_temporal_weights():

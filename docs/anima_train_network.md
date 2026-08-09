@@ -15,7 +15,7 @@ This document explains how to train LoRA (Low-Rank Adaptation) models for Anima 
 
 Qwen-Image VAE and Qwen-Image VAE have same architecture, but [official Anima weight is named for Qwen-Image VAE](https://huggingface.co/circlestone-labs/Anima/tree/main/split_files/vae).
 
-This guide assumes you already understand the basics of LoRA training. For common usage and options, see the [train_network.py guide](train_network.md). Some parameters are similar to those in [`sd3_train_network.py`](sd3_train_network.md) and [`flux_train_network.py`](flux_train_network.md).
+This guide assumes you already understand the basics of LoRA training. Use `python anima_train_network.py --help` for the authoritative argument list. SVD-Down, T-LoRA, AdaLN-specific rank/LR, free-fit dynamic compilation, REPA, Self-Flow, AnyFlow/DP-DMD distillation, and routed/conditioning adapters are documented in [Anima-specific optimization and experimental training](anima_advanced_training.md).
 
 **Prerequisites:**
 
@@ -30,7 +30,7 @@ This guide assumes you already understand the basics of LoRA training. For commo
 
 Qwen-Image VAEとQwen-Image VAEは同じアーキテクチャですが、[Anima公式の重みはQwen-Image VAE用](https://huggingface.co/circlestone-labs/Anima/tree/main/split_files/vae)のようです。
 
-このガイドは、基本的なLoRA学習の手順を理解しているユーザーを対象としています。基本的な使い方や共通のオプションについては、[`train_network.py`のガイド](train_network.md)を参照してください。また一部のパラメータは [`sd3_train_network.py`](sd3_train_network.md) や [`flux_train_network.py`](flux_train_network.md) と同様のものがあるため、そちらも参考にしてください。
+このガイドは、基本的なLoRA学習の手順を理解しているユーザーを対象としています。引数の正式な一覧は `python anima_train_network.py --help` を参照してください。
 
 **前提条件:**
 
@@ -39,27 +39,25 @@ Qwen-Image VAEとQwen-Image VAEは同じアーキテクチャですが、[Anima�
 * 学習対象のAnimaモデルファイルが準備できていること。
 </details>
 
-## 2. Differences from `train_network.py` / `train_network.py` との違い
+## 2. Anima training architecture / Anima 学習アーキテクチャ
 
-`anima_train_network.py` is based on `train_network.py` but modified for Anima. Main differences are:
+`anima_train_network.py` is the dedicated Anima LoRA entry point:
 
 * **Target models:** Anima DiT models.
 * **Model structure:** Uses a MiniTrainDIT (Transformer based) instead of U-Net. Employs a single text encoder (Qwen3-0.6B), an LLM Adapter that bridges Qwen3 embeddings to T5-compatible cross-attention space, and a Qwen-Image VAE (16-channel latent space with 8x spatial downscale).
 * **Arguments:** Uses the common `--pretrained_model_name_or_path` for the DiT model path, `--qwen3` for the Qwen3 text encoder, and `--vae` for the Qwen-Image VAE. The LLM adapter and T5 tokenizer can be specified separately with `--llm_adapter_path` and `--t5_tokenizer_path`.
-* **Incompatible arguments:** Stable Diffusion v1/v2 options such as `--v2`, `--v_parameterization` and `--clip_skip` are not used. `--fp8_base` is not supported.
-* **Timestep sampling:** Uses the same `--timestep_sampling` options as FLUX training (`sigma`, `uniform`, `sigmoid`, `shift`, `flux_shift`).
+* **Timestep sampling:** Supports `sigma`, `uniform`, `sigmoid`, `shift`, and resolution-aware `flux_shift` through the Anima flow-matching module.
 * **LoRA:** Uses regex-based module selection and per-module rank/learning rate control (`network_reg_dims`, `network_reg_lrs`) instead of per-component arguments. Module exclusion/inclusion is controlled by `exclude_patterns` and `include_patterns`.
 
 <details>
 <summary>日本語</summary>
 
-`anima_train_network.py`は`train_network.py`をベースに、Anima モデルに対応するための変更が加えられています。主な違いは以下の通りです。
+`anima_train_network.py` は Anima LoRA 学習専用のエントリーポイントです。
 
 * **対象モデル:** Anima DiTモデルを対象とします。
 * **モデル構造:** U-Netの代わりにMiniTrainDIT (Transformerベース) を使用します。テキストエンコーダーとしてQwen3-0.6B、Qwen3埋め込みをT5互換のクロスアテンション空間に変換するLLM Adapter、およびQwen-Image VAE (16チャンネル潜在空間、8倍空間ダウンスケール) を使用します。
 * **引数:** DiTモデルのパスには共通引数`--pretrained_model_name_or_path`を、Qwen3テキストエンコーダーには`--qwen3`を、Qwen-Image VAEには`--vae`を使用します。LLM AdapterとT5トークナイザーはそれぞれ`--llm_adapter_path`、`--t5_tokenizer_path`で個別に指定できます。
-* **一部引数の非互換性:** Stable Diffusion v1/v2向けの引数（例: `--v2`, `--v_parameterization`, `--clip_skip`）は使用されません。`--fp8_base`はサポートされていません。
-* **タイムステップサンプリング:** FLUX学習と同じ`--timestep_sampling`オプション（`sigma`、`uniform`、`sigmoid`、`shift`、`flux_shift`）を使用します。
+* **タイムステップサンプリング:** Anima 専用 flow-matching モジュールで `sigma`、`uniform`、`sigmoid`、`shift`、`flux_shift` をサポートします。
 * **LoRA:** コンポーネント別の引数の代わりに、正規表現ベースのモジュール選択とモジュール単位のランク/学習率制御（`network_reg_dims`、`network_reg_lrs`）を使用します。モジュールの除外/包含は`exclude_patterns`と`include_patterns`で制御します。
 </details>
 
@@ -101,7 +99,7 @@ Model files can be obtained from the [Anima HuggingFace repository](https://hugg
 
 ## 4. Running the Training / 学習の実行
 
-Execute `anima_train_network.py` from the terminal to start training. The overall command-line format is the same as `train_network.py`, but Anima specific options must be supplied.
+Execute `anima_train_network.py` from the terminal to start training.
 
 Example command:
 
@@ -115,6 +113,7 @@ accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
   --output_name="my_anima_lora" \
   --save_model_as=safetensors \
   --network_module=networks.lora_anima \
+  --network_train_unet_only \
   --network_dim=8 \
   --learning_rate=1e-4 \
   --optimizer_type="AdamW8bit" \
@@ -139,10 +138,12 @@ If loss becomes NaN, ensure you are using PyTorch version 2.5 or higher.
 
 **Note:** `--vae_chunk_size`, `--vae_disable_cache`, and `--qwen_image_vae_2d` are custom options in this repository to reduce memory usage (and, for `--qwen_image_vae_2d`, also speed up) the Qwen-Image VAE.
 
+When `--cache_text_encoder_outputs` is enabled for LoRA training, also specify `--network_train_unet_only`. This legacy option name means DiT-only network training for Anima; cached text-encoder outputs cannot be combined with a trainable text-encoder network.
+
 <details>
 <summary>日本語</summary>
 
-学習は、ターミナルから`anima_train_network.py`を実行することで開始します。基本的なコマンドラインの構造は`train_network.py`と同様ですが、Anima特有の引数を指定する必要があります。
+学習は、ターミナルから `anima_train_network.py` を実行することで開始します。
 
 コマンドラインの例は英語のドキュメントを参照してください。
 
@@ -158,7 +159,7 @@ lossがNaNになる場合は、PyTorchのバージョンが2.5以上であるこ
 
 ### 4.1. Explanation of Key Options / 主要なコマンドライン引数の解説
 
-Besides the arguments explained in the [train_network.py guide](train_network.md), specify the following Anima specific options. For shared options (`--output_dir`, `--output_name`, `--network_module`, etc.), see that guide.
+The main Anima-specific and shared training options are listed below.
 
 #### Model Options [Required] / モデル関連 [必須]
 
@@ -179,7 +180,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 #### Anima Training Parameters / Anima 学習パラメータ
 
 * `--timestep_sampling=<choice>`
-  - Timestep sampling method. Choose from `sigma`, `uniform`, `sigmoid` (default), `shift`, `flux_shift`. Same options as FLUX training. See the [flux_train_network.py guide](flux_train_network.md) for details on each method.
+  - Timestep sampling method. Choose from `sigma`, `uniform`, `sigmoid` (default), `shift`, `flux_shift`. Each method is described in Section 7.2 below.
 * `--discrete_flow_shift=<float>`
   - Shift for the timestep distribution in Rectified Flow training. Default `1.0`. This value is used when `--timestep_sampling` is set to **`shift`**. The shift formula is `t_shifted = (t * shift) / (1 + (shift - 1) * t)`.
 * `--sigmoid_scale=<float>`
@@ -230,15 +231,10 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
 * `--qwen_image_vae_2d`
   - Use the image-only 2D Qwen-Image VAE. The official (3D causal Conv3d) VAE weights are converted to equivalent 2D convolutions on load, so no separate weight file is needed and, for single images, the latents are numerically equivalent to the default 3D VAE. This is roughly 2x faster and uses about 1/3 of the peak VRAM for encode/decode (e.g., about 4.4 GB / 7.7 s -> about 1.4 GB / 4.5 s for 10 images at 1024x1024 on an RTX 3090). Recommended for latent caching. Note: with the 2D VAE the peak memory is dominated by full-resolution activations and the mid-block attention, so `--vae_chunk_size` has little further effect on the peak, and `--vae_disable_cache` is a no-op (the 2D VAE has no temporal cache).
 
-#### Incompatible or Unsupported Options / 非互換・非サポートの引数
-
-* `--v2`, `--v_parameterization`, `--clip_skip` - Options for Stable Diffusion v1/v2 that are not used for Anima training.
-* `--fp8_base` - Not supported for Anima. If specified, it will be disabled with a warning.
-
 <details>
 <summary>日本語</summary>
 
-[`train_network.py`のガイド](train_network.md)で説明されている引数に加え、以下のAnima特有の引数を指定します。共通の引数については、上記ガイドを参照してください。
+主な Anima 専用オプションと共通学習オプションを以下に示します。
 
 #### モデル関連 [必須]
 
@@ -253,7 +249,7 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
 
 #### Anima 学習パラメータ
 
-* `--timestep_sampling` - タイムステップのサンプリング方法。`sigma`、`uniform`、`sigmoid`（デフォルト）、`shift`、`flux_shift`から選択。FLUX学習と同じオプションです。各方法の詳細は[flux_train_network.pyのガイド](flux_train_network.md)を参照してください。
+* `--timestep_sampling` - タイムステップのサンプリング方法。`sigma`、`uniform`、`sigmoid`（デフォルト）、`shift`、`flux_shift`から選択。各方法は後述のセクション 7.2 で説明します。
 * `--discrete_flow_shift` - Rectified Flow学習のタイムステップ分布シフト。デフォルト`1.0`。`--timestep_sampling`が`shift`の場合に使用されます。
 * `--sigmoid_scale` - `sigmoid`、`shift`、`flux_shift`タイムステップサンプリングのスケール係数。デフォルト`1.0`。
 * `--qwen3_max_token_length` - Qwen3トークナイザーの最大トークン長。デフォルト`512`。
@@ -283,20 +279,16 @@ LoRA学習の場合は、`--network_args`の`network_reg_lrs`を使用してく�
 * `--vae_disable_cache` - Qwen-Image VAEの内部キャッシュを無効化してメモリ使用量を削減します。
 * `--qwen_image_vae_2d` - 画像専用の2D Qwen-Image VAEを使用します。公式（3D causal Conv3d）のVAE重みをロード時に等価な2D畳み込みへ変換するため、専用の重みファイルは不要で、単一画像では出力（latent）がデフォルトの3D VAEと数値的に一致します。encode/decodeが約2倍高速で、ピークVRAMが約1/3になります（RTX 3090・1024x1024・10枚で約4.4GB/7.7秒→約1.4GB/4.5秒）。latentキャッシュ用途に推奨です。注意: 2D VAEではピークメモリがフル解像度のアクティベーションやmid-blockのattentionに移るため、`--vae_chunk_size`のピークへの追加効果は小さく、また`--vae_disable_cache`は無効です（2D VAEに時間方向のキャッシュは無いため）。
 
-#### 非互換・非サポートの引数
-
-* `--v2`, `--v_parameterization`, `--clip_skip` - Stable Diffusion v1/v2向けの引数。Animaの学習では使用されません。
-* `--fp8_base` - Animaではサポートされていません。指定した場合、警告とともに無効化されます。
 </details>
 
 ### 4.2. Starting Training / 学習の開始
 
-After setting the required arguments, run the command to begin training. The overall flow and how to check logs are the same as in the [train_network.py guide](train_network.md#32-starting-the-training--学習の開始).
+After setting the required arguments, run the command and monitor the configured TensorBoard or W&B logs.
 
 <details>
 <summary>日本語</summary>
 
-必要な引数を設定したら、コマンドを実行して学習を開始します。全体の流れやログの確認方法は、[train_network.pyのガイド](train_network.md#32-starting-the-training--学習の開始)と同様です。
+必要な引数を設定したらコマンドを実行し、TensorBoard または W&B のログを確認します。
 
 </details>
 
@@ -477,15 +469,15 @@ Animaモデルは大きい場合があるため、VRAMが限られたGPUでは�
 
 #### Timestep Sampling
 
-The `--timestep_sampling` option specifies how timesteps are sampled. The available methods are the same as FLUX training:
+The `--timestep_sampling` option selects one of the Anima flow-matching sampling modes:
 
-- `sigma`: Sigma-based sampling like SD3.
+- `sigma`: Scheduler-sigma sampling with the configured weighting density.
 - `uniform`: Uniform random sampling from [0, 1].
 - `sigmoid` (default): Sample from Normal(0,1), multiply by `sigmoid_scale`, apply sigmoid. Good general-purpose option.
 - `shift`: Like `sigmoid`, but applies the discrete flow shift formula: `t_shifted = (t * shift) / (1 + (shift - 1) * t)`.
-- `flux_shift`: Resolution-dependent shift used in FLUX training.
+- `flux_shift`: Resolution-dependent shift (the option name is retained for configuration compatibility).
 
-See the [flux_train_network.py guide](flux_train_network.md) for detailed descriptions.
+The available methods and their effects are summarized above.
 
 #### Discrete Flow Shift
 
@@ -503,11 +495,11 @@ The `--weighting_scheme` option specifies loss weighting by timestep:
 - `sigma_sqrt`: Weight by `sigma^(-2)`.
 - `cosmap`: Weight by `2 / (pi * (1 - 2*sigma + 2*sigma^2))`.
 - `none`: Same as uniform.
-- `logit_normal`, `mode`: Additional schemes from SD3 training. See the [`sd3_train_network.md` guide](sd3_train_network.md) for details.
+- `logit_normal`, `mode`: Additional flow-matching loss-weighting schemes. Inspect `--help` and the training log before changing them from the default.
 
 #### Visualizing the Timestep Distribution
 
-To check how the above settings actually affect the sampled timesteps, two features are available (both shared with FLUX training):
+To check how the settings affect sampled timesteps, Anima provides two built-in features:
 
 * **Training log:** At the start of every run, a one-line summary of the timestep sampling configuration is logged. It explicitly states whether `--discrete_flow_shift` is applied for the chosen `--timestep_sampling` (only `sigma` and `shift` use it; with `sigmoid`, `uniform`, or `flux_shift` it is **ignored**). This makes it easy to notice when a shift value you set has no effect.
 * `--show_timesteps=<console|image>`: Visualize the *actual* sampled-timestep distribution and the loss weighting for the current settings, then exit without training. `console` prints an ASCII histogram; `image` shows a matplotlib plot (requires `matplotlib`). The distribution is shown from noisy (top / left, t=1000) to clean (bottom / right, t=0).
@@ -531,15 +523,15 @@ Note: Currently, only Anima supports combining `caption_dropout_rate` with text 
 
 #### タイムステップサンプリング
 
-`--timestep_sampling`でタイムステップのサンプリング方法を指定します。FLUX学習と同じ方法が利用できます：
+`--timestep_sampling` で Anima flow-matching のサンプリング方法を指定します：
 
-- `sigma`: SD3と同様のシグマベースサンプリング。
+- `sigma`: 設定した weighting density を用いる scheduler-sigma サンプリング。
 - `uniform`: [0, 1]の一様分布からサンプリング。
 - `sigmoid`（デフォルト）: 正規分布からサンプリングし、sigmoidを適用。汎用的なオプション。
 - `shift`: `sigmoid`と同様だが、離散フローシフトの式を適用。
-- `flux_shift`: FLUX学習で使用される解像度依存のシフト。
+- `flux_shift`: 解像度依存のシフト（設定互換性のためオプション名を維持）。
 
-詳細は[flux_train_network.pyのガイド](flux_train_network.md)を参照してください。
+利用可能な方式と効果は上記の一覧を参照してください。
 
 #### 離散フローシフト
 
@@ -551,7 +543,7 @@ Note: Currently, only Anima supports combining `caption_dropout_rate` with text 
 
 #### タイムステップ分布の可視化
 
-上記の設定が実際のタイムステップにどう影響するかを確認するため、2つの機能があります（FLUX学習と共通）。
+上記の設定が実際のタイムステップにどう影響するかを確認するため、Anima に2つの機能を用意しています。
 
 * **学習ログ:** 学習開始時に、タイムステップサンプリング設定の概要を1行ログ出力します。選択した`--timestep_sampling`に対して`--discrete_flow_shift`が適用されるか（使用するのは`sigma`と`shift`のみ。`sigmoid`、`uniform`、`flux_shift`では**無視**される）を明示するため、設定したシフト値が効いていない場合に気づきやすくなります。
 * `--show_timesteps=<console|image>`: 現在の設定で実際にサンプリングされるタイムステップ分布とloss weightingを可視化して終了します（学習は行いません）。`console`はASCIIヒストグラム、`image`はmatplotlibで表示します（`matplotlib`が必要）。分布はノイズ側（上／左、t=1000）からクリーン側（下／右、t=0）の順で表示されます。
@@ -604,9 +596,9 @@ Qwen3に個別の学習率を指定するには`--text_encoder_lr`を使用し�
 
 - **`--ip_noise_gamma`**, **`--ip_noise_gamma_random_strength`**: Input Perturbation noise gamma values.
 
-- **`--fused_backward_pass`**: Fuses the backward pass and optimizer step to reduce VRAM usage. Only works with Adafactor. For details, see the [`sdxl_train_network.py` guide](sdxl_train_network.md).
+- **`--fused_backward_pass`**: Fuses the backward pass and optimizer step to reduce VRAM usage. It only works with Adafactor.
 
-- **`--weighting_scheme`**, **`--logit_mean`**, **`--logit_std`**, **`--mode_scale`**: Timestep loss weighting options. For details, refer to the [`sd3_train_network.md` guide](sd3_train_network.md).
+- **`--weighting_scheme`**, **`--logit_mean`**, **`--logit_std`**, **`--mode_scale`**: Timestep loss-weighting options; use the script help and the timestep visualization before changing them.
 
 <details>
 <summary>日本語</summary>
@@ -615,7 +607,7 @@ Qwen3に個別の学習率を指定するには`--text_encoder_lr`を使用し�
 - **`--huber_schedule`**, **`--huber_c`**, **`--huber_scale`**: Huber損失のパラメータ。
 - **`--ip_noise_gamma`**: Input Perturbationノイズガンマ値。
 - **`--fused_backward_pass`**: バックワードパスとオプティマイザステップの融合。
-- **`--weighting_scheme`** 等: タイムステップ損失の重み付け。詳細は[`sd3_train_network.md`](sd3_train_network.md)を参照。
+- **`--weighting_scheme`** 等: タイムステップ損失の重み付け。変更前にスクリプトのヘルプと timestep 可視化で実際の分布を確認してください。
 
 </details>
 
@@ -664,7 +656,7 @@ The following metadata is saved in the LoRA model file:
 <details>
 <summary>日本語</summary>
 
-`anima_train_network.py`には、サンプル画像の生成 (`--sample_prompts`など) や詳細なオプティマイザ設定など、`train_network.py`と共通の機能も多く存在します。これらについては、[`train_network.py`のガイド](train_network.md#5-other-features--その他の機能)やスクリプトのヘルプ (`python anima_train_network.py --help`) を参照してください。
+`--sample_prompts` やオプティマイザの詳細は `python anima_train_network.py --help` を参照してください。
 
 ### LoRAモデルに保存されるメタデータ
 

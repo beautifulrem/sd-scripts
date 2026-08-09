@@ -45,6 +45,7 @@ class DreamBoothDataset(BaseDataset):
         max_bucket_reso: int,
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
+        bucket_free_fit: bool,
         prior_loss_weight: float,
         train_inpainting: bool,
         debug_dataset: bool,
@@ -74,6 +75,8 @@ class DreamBoothDataset(BaseDataset):
 
         self.enable_bucket = enable_bucket
         if self.enable_bucket:
+            if bucket_no_upscale and bucket_free_fit:
+                raise ValueError("bucket_no_upscale and bucket_free_fit are mutually exclusive")
             min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
                 resolution, min_bucket_reso, max_bucket_reso, bucket_reso_steps
             )
@@ -81,11 +84,13 @@ class DreamBoothDataset(BaseDataset):
             self.max_bucket_reso = max_bucket_reso
             self.bucket_reso_steps = bucket_reso_steps
             self.bucket_no_upscale = bucket_no_upscale
+            self.bucket_free_fit = bucket_free_fit
         else:
             self.min_bucket_reso = None
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
+            self.bucket_free_fit = False
 
         def read_caption(img_path, caption_extension, enable_wildcard):
             # captionの候補ファイル名を作る

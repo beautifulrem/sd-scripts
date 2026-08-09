@@ -75,7 +75,7 @@ There are two primary ways to enable validation:
 
     **Example Command:**
     ```bash
-    accelerate launch train_network.py ... --validation_split 0.1
+    accelerate launch anima_train_network.py ... --validation_split 0.1
     ```
     This command will use 10% of the total training data for validation.
 
@@ -119,7 +119,7 @@ There are two primary ways to enable validation:
 
     **コマンド例:**
     ```bash
-    accelerate launch train_network.py ... --validation_split 0.1
+    accelerate launch anima_train_network.py ... --validation_split 0.1
     ```
     このコマンドは、全学習データの10%を検証に使用します。
 
@@ -192,12 +192,15 @@ batch_size = 2
 **2. Run the training command:**
 
 ```bash
-accelerate launch sdxl_train_network.py \
-  --pretrained_model_name_or_path="sd_xl_base_1.0.safetensors" \
+accelerate launch anima_train_network.py \
+  --pretrained_model_name_or_path="anima.safetensors" \
+  --qwen3="/path/to/qwen3-0.6b" \
+  --vae="/path/to/qwen_image_vae.safetensors" \
   --dataset_config="dataset_config.toml" \
   --output_dir="output" \
   --output_name="my_lora" \
-  --network_module=networks.lora \
+  --network_module=networks.lora_anima \
+  --network_train_unet_only \
   --network_dim=32 \
   --network_alpha=16 \
   --save_every_n_epochs=1 \
@@ -241,12 +244,15 @@ batch_size = 2
 **2. 学習コマンドを実行します:**
 
 ```bash
-accelerate launch sdxl_train_network.py \
-  --pretrained_model_name_or_path="sd_xl_base_1.0.safetensors" \
+accelerate launch anima_train_network.py \
+  --pretrained_model_name_or_path="anima.safetensors" \
+  --qwen3="/path/to/qwen3-0.6b" \
+  --vae="/path/to/qwen_image_vae.safetensors" \
   --dataset_config="dataset_config.toml" \
   --output_dir="output" \
   --output_name="my_lora" \
-  --network_module=networks.lora \
+  --network_module=networks.lora_anima \
+  --network_train_unet_only \
   --network_dim=32 \
   --network_alpha=16 \
   --save_every_n_epochs=1 \

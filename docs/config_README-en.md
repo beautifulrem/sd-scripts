@@ -117,6 +117,7 @@ These are options related to the configuration of the data set. They cannot be d
 | ---- | ---- | ---- | ---- |
 | `batch_size` | `1` | o | o |
 | `bucket_no_upscale` | `true` | o | o |
+| `bucket_free_fit` | `true` | o | o |
 | `bucket_reso_steps` | `64` | o | o |
 | `enable_bucket` | `true` | o | o |
 | `max_bucket_reso` | `1024` | o | o |
@@ -128,6 +129,8 @@ These are options related to the configuration of the data set. They cannot be d
     * This corresponds to the command-line argument `--train_batch_size`.
 * `max_bucket_reso`, `min_bucket_reso`
     * Specify the maximum and minimum resolutions of the bucket. It must be divisible by `bucket_reso_steps`.
+* `bucket_free_fit`
+    * Anima-only free-fit mode: dynamically creates a step-aligned bucket near the configured target pixel area while preserving the source aspect ratio. It allows upscaling and cannot be combined with `bucket_no_upscale`.
 * `skip_image_resolution`
     * Images whose original resolution (area) is equal to or smaller than the specified resolution will be skipped. Specify as `'size'` or `[width, height]`. This corresponds to the command-line argument `--skip_image_resolution`.
     * Useful when sharing the same image directory across multiple datasets with different resolutions, to exclude low-resolution source images from higher-resolution datasets.
@@ -417,4 +420,3 @@ If you want to include `{` or `}` in the tag string, double them like `{{` or `}
 1girl, hatsune miku, vocaloid ||| stage, microphone, white shirt, smile ||| best quality, rating: general
 ```
 It becomes `1girl, hatsune miku, vocaloid, microphone, stage, white shirt, best quality, rating: general` or `1girl, hatsune miku, vocaloid, white shirt, smile, stage, microphone, best quality, rating: general` etc.
-

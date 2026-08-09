@@ -44,18 +44,12 @@ sd-scriptsのLoHaおよびLoKrの実装は、[KohakuBlueleaf](https://github.com
 
 ## Supported architectures / 対応アーキテクチャ
 
-LoHa and LoKr automatically detect the model architecture and apply appropriate default settings. The following architectures are currently supported:
-
-- **SDXL**: Targets `Transformer2DModel` for UNet and `CLIPAttention`/`CLIPMLP` for text encoders. Conv2d layers in `ResnetBlock2D`, `Downsample2D`, and `Upsample2D` are also supported when `conv_dim` is specified. No default `exclude_patterns`.
-- **Anima**: Targets `Block`, `PatchEmbed`, `TimestepEmbedding`, and `FinalLayer` for DiT, and `Qwen3Attention`/`Qwen3MLP` for the text encoder. Default `exclude_patterns` automatically skips modulation, normalization, embedder, and final_layer modules.
+For Anima, LoHa and LoKr target `Block`, `PatchEmbed`, `TimestepEmbedding`, and `FinalLayer` in the DiT, plus `Qwen3Attention`/`Qwen3MLP` when text-encoder network training is enabled. Default `exclude_patterns` skip modulation, normalization, embedder, and final-layer modules.
 
 <details>
 <summary>日本語</summary>
 
-LoHaとLoKrは、モデルのアーキテクチャを自動で検出し、適切なデフォルト設定を適用します。現在、以下のアーキテクチャに対応しています:
-
-- **SDXL**: UNetの`Transformer2DModel`、テキストエンコーダの`CLIPAttention`/`CLIPMLP`を対象とします。`conv_dim`を指定した場合、`ResnetBlock2D`、`Downsample2D`、`Upsample2D`のConv2d層も対象になります。デフォルトの`exclude_patterns`はありません。
-- **Anima**: DiTの`Block`、`PatchEmbed`、`TimestepEmbedding`、`FinalLayer`、テキストエンコーダの`Qwen3Attention`/`Qwen3MLP`を対象とします。デフォルトの`exclude_patterns`により、modulation、normalization、embedder、final_layerモジュールは自動的にスキップされます。
+Anima では、DiT の `Block`、`PatchEmbed`、`TimestepEmbedding`、`FinalLayer` と、テキストエンコーダ側を学習する場合の `Qwen3Attention`/`Qwen3MLP` を対象とします。デフォルトの `exclude_patterns` により modulation、normalization、embedder、final layer はスキップされます。
 
 </details>
 
@@ -70,40 +64,33 @@ LoHaまたはLoKrを使用するには、学習コマンドの `--network_module
 
 </details>
 
-### LoHa (SDXL)
+### LoHa (Anima)
 
 ```bash
-accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 sdxl_train_network.py \
-    --pretrained_model_name_or_path path/to/sdxl.safetensors \
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 anima_train_network.py \
+    --pretrained_model_name_or_path path/to/anima.safetensors \
+    --qwen3 path/to/qwen3-0.6b --vae path/to/qwen_image_vae.safetensors \
     --dataset_config path/to/toml \
-    --mixed_precision bf16 --fp8_base \
+    --mixed_precision bf16 --network_train_unet_only \
     --optimizer_type adamw8bit --learning_rate 2e-4 --gradient_checkpointing \
     --network_module networks.loha --network_dim 32 --network_alpha 16 \
     --max_train_epochs 16 --save_every_n_epochs 1 \
     --output_dir path/to/output --output_name my-loha
 ```
 
-### LoKr (SDXL)
+### LoKr (Anima)
 
 ```bash
-accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 sdxl_train_network.py \
-    --pretrained_model_name_or_path path/to/sdxl.safetensors \
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 anima_train_network.py \
+    --pretrained_model_name_or_path path/to/anima.safetensors \
+    --qwen3 path/to/qwen3-0.6b --vae path/to/qwen_image_vae.safetensors \
     --dataset_config path/to/toml \
-    --mixed_precision bf16 --fp8_base \
+    --mixed_precision bf16 --network_train_unet_only \
     --optimizer_type adamw8bit --learning_rate 2e-4 --gradient_checkpointing \
     --network_module networks.lokr --network_dim 32 --network_alpha 16 \
     --max_train_epochs 16 --save_every_n_epochs 1 \
     --output_dir path/to/output --output_name my-lokr
 ```
-
-For Anima, replace `sdxl_train_network.py` with `anima_train_network.py` and use the appropriate model path and options.
-
-<details>
-<summary>日本語</summary>
-
-Animaの場合は、`sdxl_train_network.py` を `anima_train_network.py` に置き換え、適切なモデルパスとオプションを使用してください。
-
-</details>
 
 ### Common training options / 共通の学習オプション
 
@@ -138,7 +125,7 @@ The following `--network_args` options are available for both LoHa and LoKr, sam
 
 ### Conv2d support / Conv2dサポート
 
-By default, LoHa and LoKr target Linear and Conv2d 1x1 layers. To also train Conv2d 3x3+ layers (e.g., in SDXL's ResNet blocks), use the `conv_dim` and `conv_alpha` options:
+By default, LoHa and LoKr target Linear and Conv2d 1x1 layers. If a selected Anima-side module contains Conv2d 3x3+ layers, use the `conv_dim` and `conv_alpha` options to include them:
 
 ```bash
 --network_args "conv_dim=16" "conv_alpha=8"
@@ -156,7 +143,7 @@ For Conv2d 3x3+ layers, you can enable Tucker decomposition for more efficient p
 <details>
 <summary>日本語</summary>
 
-デフォルトでは、LoHaとLoKrはLinearおよびConv2d 1x1層を対象とします。Conv2d 3x3+層（SDXLのResNetブロックなど）も学習するには、`conv_dim`と`conv_alpha`オプションを使用します:
+デフォルトでは、LoHaとLoKrはLinearおよびConv2d 1x1層を対象とします。選択した Anima 側モジュールに Conv2d 3x3+ 層が含まれる場合は、`conv_dim` と `conv_alpha` を指定します:
 
 ```bash
 --network_args "conv_dim=16" "conv_alpha=8"
@@ -307,33 +294,6 @@ Trained LoHa/LoKr weights are saved in safetensors format, just like LoRA.
 <summary>日本語</summary>
 
 学習済みのLoHa/LoKrの重みは、LoRAと同様にsafetensors形式で保存されます。
-
-</details>
-
-### SDXL
-
-For SDXL, use `gen_img.py` with `--network_module` and `--network_weights`, the same way as LoRA:
-
-```bash
-python gen_img.py --ckpt path/to/sdxl.safetensors \
-    --network_module networks.loha --network_weights path/to/loha.safetensors \
-    --prompt "your prompt" ...
-```
-
-Replace `networks.loha` with `networks.lokr` for LoKr weights.
-
-<details>
-<summary>日本語</summary>
-
-SDXLでは、LoRAと同様に `gen_img.py` で `--network_module` と `--network_weights` を指定します:
-
-```bash
-python gen_img.py --ckpt path/to/sdxl.safetensors \
-    --network_module networks.loha --network_weights path/to/loha.safetensors \
-    --prompt "your prompt" ...
-```
-
-LoKrの重みを使用する場合は `networks.loha` を `networks.lokr` に置き換えてください。
 
 </details>
 

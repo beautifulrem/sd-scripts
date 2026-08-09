@@ -36,7 +36,7 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
 
-    # This is not working for all cases (e.g. SD3), so we need to find the corresponding modules
+    # Find the corresponding Anima modules instead of relying on parameter order.
     # for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
     #     print(module_to_cpu.__class__, module_to_cuda.__class__)
     #     if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:

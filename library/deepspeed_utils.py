@@ -1,7 +1,7 @@
 import os
 import argparse
 import torch
-from accelerate import DeepSpeedPlugin, Accelerator
+from accelerate import DeepSpeedPlugin
 
 from .utils import setup_logging
 
@@ -75,7 +75,7 @@ def prepare_deepspeed_plugin(args: argparse.Namespace):
 
     try:
         import deepspeed
-    except ImportError as e:
+    except ImportError:
         logger.error(
             "deepspeed is not installed. please install deepspeed in your environment with following command. DS_BUILD_OPS=0 pip install deepspeed"
         )

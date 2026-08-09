@@ -12,20 +12,20 @@ init_ipex()
 
 from library import (
     anima_models,
+    anima_flow_matching,
+    anima_advanced_training,
+    anima_prompt_utils,
     anima_train_utils,
     anima_utils,
-    flux_train_utils,
     qwen_image_autoencoder_kl,
-    sd3_train_utils,
     strategy_anima,
     strategy_base,
-    sampling,
 )
-import library.args as args_util
+import library.anima_args as args_util
 import library.compile_utils as compile_utils
-import library.model_io as model_io
+import library.anima_model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
-import train_network
+from library import anima_network_trainer
 from library.utils import setup_logging
 
 setup_logging()
@@ -34,10 +34,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class AnimaNetworkTrainer(train_network.NetworkTrainer):
+class AnimaNetworkTrainer(anima_network_trainer.AnimaNetworkTrainerBase):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        self._repa_captured = None
+        self._advanced_aux_loss = None
+        self._train_micro_step = 0
 
     def assert_extra_args(
         self,
@@ -45,13 +48,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[DatasetGroup, MinimalDataset],
         val_dataset_group: Optional[DatasetGroup],
     ):
-        flux_train_utils.log_timestep_sampling_info(args)
-
-        if args.fp8_base or args.fp8_base_unet:
-            logger.warning("fp8_base and fp8_base_unet are not supported. / fp8_baseとfp8_base_unetはサポートされていません。")
-            args.fp8_base = False
-            args.fp8_base_unet = False
-        args.fp8_scaled = False  # Anima DiT does not support fp8_scaled
+        anima_flow_matching.log_timestep_sampling_info(args)
 
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             logger.warning("cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled")
@@ -91,6 +88,62 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 " / --compile_fullgraphは--split_attnと併用できません（split attentionは動的な制御フローを使用します）"
             )
 
+        if args.activation_memory_budget is not None:
+            assert args.compile, "--activation_memory_budget requires --compile"
+            assert 0.0 <= args.activation_memory_budget <= 1.0, "--activation_memory_budget must be in [0, 1]"
+        if args.compile_dynamic_sequence:
+            assert args.compile, "--compile_dynamic_sequence requires --compile"
+            if args.compile_dynamic_sequence_min_tokens is not None:
+                assert args.compile_dynamic_sequence_min_tokens > 0
+            if args.compile_dynamic_sequence_max_tokens is not None:
+                assert args.compile_dynamic_sequence_max_tokens > 0
+            if args.compile_dynamic_sequence_min_tokens is not None and args.compile_dynamic_sequence_max_tokens is not None:
+                assert args.compile_dynamic_sequence_min_tokens <= args.compile_dynamic_sequence_max_tokens
+
+        if args.compile and args.compile_fullgraph and args.gradient_checkpointing:
+            network_args = {}
+            for network_arg in args.network_args or []:
+                key, value = network_arg.split("=", 1)
+                network_args[key] = value
+            uses_external_checkpoint_context = args.network_module in {
+                "networks.chimera_lora_anima",
+                "networks.turbo_dmd_anima",
+                "networks.easycontrol_anima",
+            } or str(network_args.get("use_timestep_mask", "false")).lower() in {"1", "true", "yes", "on"}
+            if uses_external_checkpoint_context:
+                raise ValueError(
+                    "--compile_fullgraph cannot be combined with gradient checkpointing for T-LoRA, Chimera, "
+                    "Turbo-DMD, or EasyControl because their checkpoint recomputation context requires a graph break; "
+                    "omit --compile_fullgraph (ordinary --compile remains supported)"
+                )
+
+        assert args.repa_weight >= 0.0
+        assert args.self_flow_weight >= 0.0
+        assert 0.0 < args.self_flow_delta <= 1.0
+        assert args.dp_dmd_weight >= 0.0
+        assert args.dp_dmd_critic_weight >= 0.0
+        assert args.dp_dmd_steps >= 2
+        if args.dp_dmd_weight > 0:
+            assert args.network_module == "networks.turbo_dmd_anima", (
+                "--dp_dmd_weight requires --network_module=networks.turbo_dmd_anima"
+            )
+        assert args.anyflow_weight >= 0.0
+        assert args.anyflow_teacher_steps >= 1
+        assert 0.0 < args.anyflow_min_interval < 1.0
+        if args.anyflow_weight > 0:
+            assert args.network_module == "networks.flow_map_lora_anima", (
+                "--anyflow_weight requires --network_module=networks.flow_map_lora_anima"
+            )
+            assert args.dp_dmd_weight == 0, "AnyFlow and DP-DMD use different adapter formats and cannot share one run"
+        if args.repa_weight > 0:
+            assert train_dataset_group.is_repa_feature_compatible(), (
+                "REPA sidecars require flip_aug, color_aug and random_crop to be disabled"
+            )
+            assert args.repa_layer >= 0
+            assert args.repa_dog_sigma_divisor > 0
+            assert args.repa_max_tokens > 0
+            train_dataset_group.enable_repa_features(args.repa_feature_suffix, args.repa_feature_key)
+
         train_dataset_group.verify_bucket_reso_steps(16)  # WanVAE spatial downscale = 8 and patch size = 2
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
@@ -113,7 +166,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return "anima", [qwen3_text_encoder], vae, None  # unet loaded lazily
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
-        loading_dtype = None if args.fp8_scaled else weight_dtype
+        loading_dtype = weight_dtype
         loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
 
         attn_mode = "torch"
@@ -131,10 +184,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             args.split_attn,
             loading_device,
             loading_dtype,
-            args.fp8_scaled,
+            False,
         )
 
-        # Store unsloth preference so that when the base NetworkTrainer calls
+        # Store unsloth preference so that the Anima trainer base can
         # dit.enable_gradient_checkpointing(cpu_offload=...), we can override to use unsloth.
         # The base trainer only passes cpu_offload, so we store the flag on the model.
         self._use_unsloth_offload_checkpointing = args.unsloth_offload_checkpointing
@@ -167,7 +220,19 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return strategy_anima.AnimaTextEncodingStrategy()
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
-        pass
+        if args.repa_weight <= 0:
+            return
+        if args.repa_layer >= len(unet.blocks):
+            raise ValueError(f"repa_layer={args.repa_layer} but Anima has only {len(unet.blocks)} blocks")
+
+        def capture_repa(_module, _inputs, output):
+            self._repa_captured = output
+
+        unet.blocks[args.repa_layer].register_forward_hook(capture_repa)
+        accelerator.print(
+            f"Relational REPA enabled: block={args.repa_layer}, weight={args.repa_weight}, "
+            f"DoG={not args.repa_disable_dog}, max_tokens={args.repa_max_tokens}"
+        )
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         if args.cache_text_encoder_outputs:
@@ -205,7 +270,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
                 text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-                prompts = sampling.load_prompts(args.sample_prompts)
+                prompts = anima_prompt_utils.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}
                 with accelerator.autocast(), torch.no_grad():
                     for prompt_dict in prompts:
@@ -240,6 +305,49 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
         tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+        dit = accelerator.unwrap_model(unet)
+        adapter_ref = getattr(dit, "_anima_adapter_network", None)
+        adapter = adapter_ref() if adapter_ref is not None else None
+        on_prompt_start = on_prompt_end = None
+        if adapter is not None and hasattr(adapter, "set_condition_latents"):
+
+            def on_prompt_start(prompt_dict, callback_accelerator):
+                import os
+
+                import numpy as np
+                from PIL import Image
+
+                from library.utils import IMAGE_TRANSFORMS
+
+                condition_path = prompt_dict.get("controlnet_image")
+                if condition_path is None or not os.path.isfile(condition_path):
+                    logger.warning(
+                        "EasyControl sample has no valid control image; add '--cn <path>' to the sample prompt"
+                    )
+                    adapter.clear_condition_latents()
+                    return
+                width = max(64, int(prompt_dict.get("width", 512)) // 16 * 16)
+                height = max(64, int(prompt_dict.get("height", 512)) // 16 * 16)
+                with Image.open(condition_path) as image:
+                    image = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+                    pixels = IMAGE_TRANSFORMS(np.asarray(image).copy()).unsqueeze(0)
+                original_vae_device = vae.device
+                vae.to(callback_accelerator.device)
+                try:
+                    with torch.no_grad():
+                        condition_latents = self.encode_images_to_latents(
+                            args,
+                            vae,
+                            pixels.to(callback_accelerator.device, dtype=vae.dtype),
+                        )
+                finally:
+                    vae.to(original_vae_device)
+                    clean_memory_on_device(callback_accelerator.device)
+                adapter.set_condition_latents(condition_latents)
+
+            def on_prompt_end(_prompt_dict):
+                adapter.clear_condition_latents()
+
         anima_train_utils.sample_images(
             accelerator,
             args,
@@ -251,10 +359,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             tokenize_strategy,
             text_encoding_strategy,
             self.sample_prompts_te_outputs,
+            on_prompt_start=on_prompt_start,
+            on_prompt_end=on_prompt_end,
         )
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
-        noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
+        noise_scheduler = anima_flow_matching.AnimaFlowMatchScheduler(
+            num_train_timesteps=1000, shift=args.discrete_flow_shift
+        )
         return noise_scheduler
 
     def encode_images_to_latents(self, args, vae, images):
@@ -294,7 +406,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             t = torch.tensor(offsets, dtype=torch.float32)
             if t.abs().sum() > 0:
                 tso = t
-        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+        noisy_model_input, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
             timestep_sampling_offset=tso,
         )
@@ -326,16 +438,218 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
-        with torch.set_grad_enabled(is_train), accelerator.autocast():
-            model_pred = anima(
-                noisy_model_input,
-                timesteps,
-                prompt_embeds,
-                padding_mask=padding_mask,
-                target_input_ids=t5_input_ids,
-                target_attention_mask=t5_attn_mask,
-                source_attention_mask=attn_mask,
-            )
+        self._advanced_aux_loss = None
+        self._repa_captured = None
+        unwrapped_network = None
+        if network is not None:
+            unwrap_model = getattr(accelerator, "unwrap_model", None)
+            unwrapped_network = unwrap_model(network) if unwrap_model is not None else network
+        if is_train and unwrapped_network is not None and hasattr(unwrapped_network, "set_timestep_mask"):
+            unwrapped_network.set_timestep_mask(sigmas.flatten())
+        if unwrapped_network is not None and hasattr(unwrapped_network, "set_step_sigmas"):
+            unwrapped_network.set_step_sigmas(sigmas.flatten())
+        if unwrapped_network is not None and hasattr(unwrapped_network, "set_frequency_context"):
+            unwrapped_network.set_frequency_context(sigmas.flatten(), noisy_model_input)
+        if unwrapped_network is not None and hasattr(unwrapped_network, "set_adapter_mode"):
+            unwrapped_network.set_adapter_mode("generator")
+        try:
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+
+                auxiliary_terms = []
+                if is_train and unwrapped_network is not None and hasattr(unwrapped_network, "get_auxiliary_loss"):
+                    network_aux = unwrapped_network.get_auxiliary_loss()
+                    if network_aux is not None:
+                        auxiliary_terms.append(network_aux)
+                repa_weight = float(getattr(args, "repa_weight", 0.0) or 0.0)
+                if is_train and repa_weight > 0 and self._repa_captured is not None:
+                    repa_features = batch.get("repa_features")
+                    if repa_features is None:
+                        raise RuntimeError("REPA is enabled but this batch has no repa_features")
+                    cutoff = float(getattr(args, "repa_anneal_steps", 0.0) or 0.0)
+                    if 0 < cutoff <= 1:
+                        cutoff *= args.max_train_steps
+                    optimizer_step = self._train_micro_step // max(1, args.gradient_accumulation_steps)
+                    if cutoff <= 0 or optimizer_step < cutoff:
+                        repa_loss = anima_advanced_training.relational_repa_loss(
+                            self._repa_captured,
+                            repa_features.to(accelerator.device),
+                            (latents.shape[-2], latents.shape[-1]),
+                            patch_size=anima.patch_spatial,
+                            has_cls_token=not args.repa_no_cls_token,
+                            use_dog=not args.repa_disable_dog,
+                            dog_sigma_divisor=args.repa_dog_sigma_divisor,
+                            max_tokens=args.repa_max_tokens,
+                        )
+                        auxiliary_terms.append(repa_weight * repa_loss)
+
+                self_flow_weight = float(getattr(args, "self_flow_weight", 0.0) or 0.0)
+                if is_train and self_flow_weight > 0:
+                    transported, next_sigmas = anima_advanced_training.transported_self_flow_input(
+                        noisy_model_input, model_pred, sigmas.flatten(), args.self_flow_delta
+                    )
+                    if unwrapped_network is not None and hasattr(unwrapped_network, "set_timestep_mask"):
+                        unwrapped_network.set_timestep_mask(next_sigmas)
+                    self_flow_pred = anima(
+                        transported,
+                        next_sigmas,
+                        prompt_embeds,
+                        padding_mask=padding_mask,
+                        target_input_ids=t5_input_ids,
+                        target_attention_mask=t5_attn_mask,
+                        source_attention_mask=attn_mask,
+                    )
+                    self_flow_loss = torch.nn.functional.mse_loss(self_flow_pred.float(), model_pred.detach().float())
+                    auxiliary_terms.append(self_flow_weight * self_flow_loss)
+
+                anyflow_weight = float(getattr(args, "anyflow_weight", 0.0) or 0.0)
+                if is_train and anyflow_weight > 0:
+                    if unwrapped_network is None or not hasattr(unwrapped_network, "set_flow_interval"):
+                        raise RuntimeError("AnyFlow distillation requires FlowMapLoRANetwork")
+                    source_t = sigmas.flatten().detach()
+                    max_interval = source_t.clamp_min(args.anyflow_min_interval)
+                    interval = args.anyflow_min_interval + torch.rand_like(source_t) * (
+                        max_interval - args.anyflow_min_interval
+                    ).clamp_min(0)
+                    target_r = (source_t - interval).clamp_min(0.0)
+
+                    # Frozen base Anima supplies an ODE transition target over
+                    # the arbitrary [t,r] interval.
+                    unwrapped_network.set_enabled(False)
+                    unwrapped_network.clear_flow_interval()
+                    teacher_state = noisy_model_input.detach()
+                    with torch.no_grad():
+                        for teacher_index in range(args.anyflow_teacher_steps):
+                            fraction = teacher_index / args.anyflow_teacher_steps
+                            next_fraction = (teacher_index + 1) / args.anyflow_teacher_steps
+                            teacher_t = source_t + (target_r - source_t) * fraction
+                            teacher_next = source_t + (target_r - source_t) * next_fraction
+                            teacher_velocity = anima(
+                                teacher_state,
+                                teacher_t,
+                                prompt_embeds,
+                                padding_mask=padding_mask,
+                                target_input_ids=t5_input_ids,
+                                target_attention_mask=t5_attn_mask,
+                                source_attention_mask=attn_mask,
+                            )
+                            dt = (teacher_next - teacher_t).view(-1, 1, 1, 1, 1).to(teacher_state)
+                            teacher_state = teacher_state + teacher_velocity * dt
+                    mean_velocity_target = (teacher_state - noisy_model_input.detach()) / (
+                        (target_r - source_t).view(-1, 1, 1, 1, 1).to(noisy_model_input).clamp_max(-1e-6)
+                    )
+
+                    unwrapped_network.set_enabled(True)
+                    unwrapped_network.set_flow_interval(source_t, target_r)
+                    flow_map_velocity = anima(
+                        noisy_model_input,
+                        source_t,
+                        prompt_embeds,
+                        padding_mask=padding_mask,
+                        target_input_ids=t5_input_ids,
+                        target_attention_mask=t5_attn_mask,
+                        source_attention_mask=attn_mask,
+                    )
+                    unwrapped_network.clear_flow_interval()
+                    per_sample_flow_loss = (flow_map_velocity.float() - mean_velocity_target.float()).square().mean(
+                        dim=tuple(range(1, flow_map_velocity.ndim))
+                    )
+                    valid_intervals = ((source_t - target_r) > 1e-6).to(per_sample_flow_loss)
+                    # A zero-length [t,r] interval has no velocity target.
+                    anyflow_loss = (per_sample_flow_loss * valid_intervals).sum() / valid_intervals.sum().clamp_min(1)
+                    auxiliary_terms.append(anyflow_weight * anyflow_loss)
+
+                dp_dmd_weight = float(getattr(args, "dp_dmd_weight", 0.0) or 0.0)
+                if is_train and dp_dmd_weight > 0:
+                    if unwrapped_network is None or not hasattr(unwrapped_network, "set_adapter_mode"):
+                        raise RuntimeError("DP-DMD requires the dual-branch TurboDMD network")
+                    step_grid = torch.linspace(
+                        1.0, 0.0, int(args.dp_dmd_steps) + 1, device=noise.device, dtype=torch.float32
+                    )
+                    generated = noise.unsqueeze(2)
+                    for step_index in range(args.dp_dmd_steps):
+                        step_sigma = step_grid[step_index].expand(bs)
+                        if hasattr(unwrapped_network, "set_timestep_mask"):
+                            unwrapped_network.set_timestep_mask(step_sigma)
+                        generated_velocity = anima(
+                            generated,
+                            step_sigma,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            target_input_ids=t5_input_ids,
+                            target_attention_mask=t5_attn_mask,
+                            source_attention_mask=attn_mask,
+                        )
+                        generated = generated + generated_velocity * (step_grid[step_index + 1] - step_grid[step_index])
+                        if step_index == 0:
+                            # DP-DMD role separation: no DMD gradient reaches
+                            # the diversity-anchor first step.
+                            generated = generated.detach()
+
+                    critic_sigmas = sigmas.flatten().detach()
+                    critic_eps = torch.randn_like(generated)
+                    sigma_view = critic_sigmas.view(-1, 1, 1, 1, 1).to(generated)
+                    fake_noisy = (1 - sigma_view) * generated + sigma_view * critic_eps
+                    if hasattr(unwrapped_network, "set_timestep_mask"):
+                        unwrapped_network.set_timestep_mask(critic_sigmas)
+                    unwrapped_network.set_adapter_mode("critic")
+                    fake_velocity = anima(
+                        fake_noisy.detach(),
+                        critic_sigmas,
+                        prompt_embeds,
+                        padding_mask=padding_mask,
+                        target_input_ids=t5_input_ids,
+                        target_attention_mask=t5_attn_mask,
+                        source_attention_mask=attn_mask,
+                    )
+                    unwrapped_network.set_adapter_mode("base")
+                    with torch.no_grad():
+                        teacher_velocity = anima(
+                            fake_noisy.detach(),
+                            critic_sigmas,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            target_input_ids=t5_input_ids,
+                            target_attention_mask=t5_attn_mask,
+                            source_attention_mask=attn_mask,
+                        )
+                    unwrapped_network.set_adapter_mode("generator")
+
+                    critic_target = critic_eps - generated.detach()
+                    critic_loss = torch.nn.functional.mse_loss(fake_velocity.float(), critic_target.float())
+                    dmd_direction = fake_velocity.detach().float() - teacher_velocity.detach().float()
+                    norm_dims = tuple(range(1, dmd_direction.ndim))
+                    dmd_direction = dmd_direction / dmd_direction.abs().mean(dim=norm_dims, keepdim=True).clamp_min(1e-6)
+                    dmd_loss = (generated.float() * dmd_direction).mean()
+                    auxiliary_terms.append(dp_dmd_weight * dmd_loss)
+                    auxiliary_terms.append(float(args.dp_dmd_critic_weight) * critic_loss)
+
+                if auxiliary_terms:
+                    self._advanced_aux_loss = torch.stack(auxiliary_terms).sum()
+                if is_train:
+                    self._train_micro_step += 1
+        finally:
+            # T-LoRA is training-only. Clearing here guarantees ordinary full-rank
+            # validation, sampling, saving, and inference behavior.
+            if unwrapped_network is not None and hasattr(unwrapped_network, "clear_timestep_mask"):
+                unwrapped_network.clear_timestep_mask()
+            if unwrapped_network is not None and hasattr(unwrapped_network, "clear_step_sigmas"):
+                unwrapped_network.clear_step_sigmas()
+            if unwrapped_network is not None and hasattr(unwrapped_network, "clear_frequency_context"):
+                unwrapped_network.clear_frequency_context()
+            if unwrapped_network is not None and hasattr(unwrapped_network, "set_adapter_mode"):
+                unwrapped_network.set_adapter_mode("generator")
+            if unwrapped_network is not None and hasattr(unwrapped_network, "clear_flow_interval"):
+                unwrapped_network.clear_flow_interval()
+                unwrapped_network.set_enabled(True)
         model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
 
         # Rectified flow target: noise - latents
@@ -366,6 +680,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     ) -> torch.Tensor:
         """Override base process_batch for caption dropout with cached text encoder outputs."""
 
+        unwrapped_network = None
+        if network is not None:
+            unwrap_model = getattr(accelerator, "unwrap_model", None)
+            unwrapped_network = unwrap_model(network) if unwrap_model is not None else network
+        if unwrapped_network is not None and hasattr(unwrapped_network, "set_condition_latents"):
+            conditioning_images = batch.get("conditioning_images")
+            if conditioning_images is None:
+                raise RuntimeError("EasyControl requires a ControlNet dataset with conditioning_images")
+            with torch.no_grad():
+                condition_latents = self.encode_images_to_latents(
+                    args, vae, conditioning_images.to(accelerator.device, dtype=vae_dtype)
+                )
+            unwrapped_network.set_condition_latents(condition_latents)
+
         # Text encoder conditions
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         anima_text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = text_encoding_strategy
@@ -380,29 +708,35 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # Add the caption dropout rates back to the list for validation dataset (which is re-used batch items)
             batch["text_encoder_outputs_list"] = text_encoder_outputs_list + [caption_dropout_rates]
 
-        return super().process_batch(
-            batch,
-            text_encoders,
-            unet,
-            network,
-            vae,
-            noise_scheduler,
-            vae_dtype,
-            weight_dtype,
-            accelerator,
-            args,
-            text_encoding_strategy,
-            tokenize_strategy,
-            is_train,
-            train_text_encoder,
-            train_unet,
-        )
+        try:
+            return super().process_batch(
+                batch,
+                text_encoders,
+                unet,
+                network,
+                vae,
+                noise_scheduler,
+                vae_dtype,
+                weight_dtype,
+                accelerator,
+                args,
+                text_encoding_strategy,
+                tokenize_strategy,
+                is_train,
+                train_text_encoder,
+                train_unet,
+            )
+        finally:
+            if unwrapped_network is not None and hasattr(unwrapped_network, "clear_condition_latents"):
+                unwrapped_network.clear_condition_latents()
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
-        return loss
+        auxiliary = self._advanced_aux_loss
+        self._advanced_aux_loss = None
+        return loss if auxiliary is None else loss + auxiliary
 
     def get_sai_model_spec(self, args):
-        return model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
+        return model_io.get_anima_model_spec_dataclass(args, lora=True).to_metadata_dict()
 
     def update_metadata(self, metadata, args):
         metadata["ss_weighting_scheme"] = args.weighting_scheme
@@ -424,7 +758,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
-        # The base NetworkTrainer only calls enable_gradient_checkpointing(cpu_offload=True/False),
+        # The Anima trainer base only calls enable_gradient_checkpointing(cpu_offload=True/False),
         # so we re-apply with unsloth_offload if needed (after base has already enabled it).
         if self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
             unet.enable_gradient_checkpointing(unsloth_offload=True)
@@ -439,6 +773,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # CUDA perf switches are independent of torch.compile; apply whenever requested.
         compile_utils.apply_cuda_optimizations(args)
+
+        if args.fuse_qkv_projections:
+            dit = accelerator.unwrap_model(model)
+            enabled, skipped = anima_models.enable_attention_projection_fusion(dit)
+            logger.info(f"Enabled fused Anima attention projections for {enabled} modules")
+            if skipped:
+                logger.warning(
+                    f"Skipped projection fusion for {skipped} attention modules with unsupported adapter monkey-patches"
+                )
 
         if args.compile:
             # Apply per-block torch.compile to the DiT blocks. Reach the real Anima via
@@ -455,7 +798,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
 
 def setup_parser() -> argparse.ArgumentParser:
-    parser = train_network.setup_parser()
+    parser = anima_network_trainer.setup_parser()
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")

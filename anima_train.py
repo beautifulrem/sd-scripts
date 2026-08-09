@@ -1,35 +1,31 @@
 # Anima full finetune training script
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import copy
 import gc
 import math
 import os
 from multiprocessing import Value
-from typing import List
 import toml
 
 from tqdm import tqdm
 
 import torch
-from library import flux_train_utils, qwen_image_autoencoder_kl
+from library import anima_flow_matching, anima_prompt_utils
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
+from library import deepspeed_utils, anima_model_spec, anima_train_utils, anima_utils, strategy_base, strategy_anima
 
 import library.accelerator_setup as accelerator_setup
-import library.args as args_util
+import library.anima_args as args_util
 import library.dataset as dataset_util
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
-import library.loss as loss_util
+import library.anima_loss as loss_util
 import library.checkpoint_io as checkpoint_io
-import library.sampling as sampling
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -44,7 +40,7 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
+from library.anima_loss import apply_masked_loss
 
 
 def train(args):
@@ -53,7 +49,7 @@ def train(args):
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
-    flux_train_utils.log_timestep_sampling_info(args)
+    anima_flow_matching.log_timestep_sampling_info(args)
 
     # backward compatibility
     if not args.skip_cache_check:
@@ -131,10 +127,9 @@ def train(args):
                 }
 
         blueprint = blueprint_generator.generate(user_config, args)
-        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, _ = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         train_dataset_group = dataset_util.load_arbitrary_dataset(args)
-        val_dataset_group = None
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -210,7 +205,7 @@ def train(args):
         # cache sample prompt embeddings
         if args.sample_prompts is not None:
             logger.info(f"Cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
-            prompts = sampling.load_prompts(args.sample_prompts)
+            prompts = anima_prompt_utils.load_prompts(args.sample_prompts)
             sample_prompts_te_outputs = {}
             with accelerator.autocast(), torch.no_grad():
                 for prompt_dict in prompts:
@@ -427,7 +422,9 @@ def train(args):
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
 
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
+    noise_scheduler = anima_flow_matching.AnimaFlowMatchScheduler(
+        num_train_timesteps=1000, shift=args.discrete_flow_shift
+    )
     # Copy for noise and timestep generation, because noise_scheduler may be changed during training in future
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
@@ -537,7 +534,7 @@ def train(args):
                 noise = torch.randn_like(latents)
 
                 # Get noisy model input and timesteps
-                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                noisy_model_input, timesteps, sigmas = anima_flow_matching.get_noisy_model_input_and_timesteps(
                     args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
                 )
                 timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
@@ -577,7 +574,7 @@ def train(args):
                 )
 
                 # Loss
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
                 loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     loss = apply_masked_loss(loss, batch)
@@ -703,8 +700,6 @@ def train(args):
     if args.save_state or args.save_state_on_train_end:
         checkpoint_io.save_state_on_train_end(args, accelerator)
 
-    del accelerator
-
     if is_main_process and train_dit:
         anima_train_utils.save_anima_model_on_train_end(
             args,
@@ -720,18 +715,17 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    args_util.add_sd_models_arguments(parser)
+    args_util.add_anima_model_arguments(parser)
     args_util.add_dataset_arguments(parser, True, True, True)
     args_util.add_training_arguments(parser, False)
     args_util.add_masked_loss_arguments(parser)
     deepspeed_utils.add_deepspeed_arguments(parser)
-    args_util.add_sd_saving_arguments(parser)
+    args_util.add_anima_saving_arguments(parser)
     args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
-    add_custom_train_arguments(parser)
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
-    sai_model_spec.add_model_spec_arguments(parser)
+    anima_model_spec.add_model_spec_arguments(parser)
 
     parser.add_argument(
         "--cpu_offload_checkpointing",

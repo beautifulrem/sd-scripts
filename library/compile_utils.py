@@ -13,7 +13,6 @@ can reuse them by passing their own list of block ModuleLists as ``target_blocks
 """
 
 import argparse
-from typing import Union
 
 import torch
 
@@ -23,6 +22,57 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def set_activation_memory_budget(budget: float | None) -> None:
+    """Configure PyTorch's min-cut partitioner activation-memory trade-off.
+
+    This is intentionally isolated here because ``torch._functorch`` is a private,
+    version-dependent API. A requested budget must never be silently ignored.
+    """
+    if budget is None:
+        return
+    if not 0.0 <= budget <= 1.0:
+        raise ValueError("--activation_memory_budget must be between 0 and 1")
+    try:
+        import torch._functorch.config as functorch_config
+    except ImportError as exc:
+        raise RuntimeError(
+            "This PyTorch build does not expose activation_memory_budget; upgrade PyTorch or omit the option"
+        ) from exc
+    if not hasattr(functorch_config, "activation_memory_budget"):
+        raise RuntimeError(
+            "This PyTorch build does not expose activation_memory_budget; upgrade PyTorch or omit the option"
+        )
+    functorch_config.activation_memory_budget = budget
+    logger.info(f"torch.compile activation memory budget set to {budget:.3f}")
+
+
+def _mark_anima_sequence_dynamic(args: argparse.Namespace, module: torch.nn.Module) -> None:
+    """Install an outer pre-hook that marks the Anima token grid dynamic.
+
+    The hook is registered on the ``OptimizedModule`` after ``torch.compile`` so
+    ``mark_dynamic`` executes before Dynamo enters the compiled block. The exact
+    token-count bounds are checked here; per-axis upper bounds help symbolic-shape
+    inference without assuming a particular aspect ratio.
+    """
+    min_tokens = getattr(args, "compile_dynamic_sequence_min_tokens", None)
+    max_tokens = getattr(args, "compile_dynamic_sequence_max_tokens", None)
+
+    def mark_dynamic(_module, inputs):
+        if not inputs or not isinstance(inputs[0], torch.Tensor) or inputs[0].ndim != 5:
+            raise RuntimeError("Anima dynamic-sequence compilation expects a B,T,H,W,D tensor as block input")
+        x = inputs[0]
+        token_count = x.shape[1] * x.shape[2] * x.shape[3]
+        if min_tokens is not None and token_count < min_tokens:
+            raise ValueError(f"Anima token count {token_count} is below configured minimum {min_tokens}")
+        if max_tokens is not None and token_count > max_tokens:
+            raise ValueError(f"Anima token count {token_count} exceeds configured maximum {max_tokens}")
+        axis_max = max_tokens if max_tokens is not None else None
+        for axis in (1, 2, 3):
+            torch._dynamo.mark_dynamic(x, axis, min=1, max=axis_max)
+
+    module.register_forward_pre_hook(mark_dynamic)
 
 
 def disable_linear_from_compile(module: torch.nn.Module):
@@ -54,7 +104,7 @@ def apply_cuda_optimizations(args: argparse.Namespace):
 def compile_transformer(
     args: argparse.Namespace,
     transformer: torch.nn.Module,
-    target_blocks: list[Union[torch.nn.ModuleList, list[torch.nn.Module]]],
+    target_blocks: list[torch.nn.ModuleList | list[torch.nn.Module]],
     disable_linear: bool,
 ) -> torch.nn.Module:
     """Compile each block in ``target_blocks`` individually with torch.compile.
@@ -74,9 +124,14 @@ def compile_transformer(
             for block in blocks:
                 disable_linear_from_compile(block)
 
+    set_activation_memory_budget(getattr(args, "activation_memory_budget", None))
+
     compile_dynamic = None
     if args.compile_dynamic is not None:
         compile_dynamic = {"true": True, "false": False, "auto": None}[args.compile_dynamic.lower()]
+
+    if getattr(args, "compile_dynamic_sequence", False):
+        compile_dynamic = True
 
     logger.info(
         f"Compiling DiT blocks with torch.compile: backend={args.compile_backend}, mode={args.compile_mode}, "
@@ -96,11 +151,14 @@ def compile_transformer(
 
     for blocks in target_blocks:
         for i, block in enumerate(blocks):
-            blocks[i] = torch.compile(
+            compiled_block = torch.compile(
                 block,
                 backend=args.compile_backend,
                 mode=args.compile_mode,
                 dynamic=compile_dynamic,
                 fullgraph=args.compile_fullgraph,
             )
+            if getattr(args, "compile_dynamic_sequence", False):
+                _mark_anima_sequence_dynamic(args, compiled_block)
+            blocks[i] = compiled_block
     return transformer

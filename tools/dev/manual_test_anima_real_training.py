@@ -22,10 +22,14 @@ Each test runs only 2 training steps then stops.
 
 import argparse
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import shutil
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def create_dataset_toml(image_dir: str, resolution: int, toml_path: str):
@@ -33,7 +37,7 @@ def create_dataset_toml(image_dir: str, resolution: int, toml_path: str):
     content = f"""[general]
 resolution = {resolution}
 enable_bucket = true
-bucket_reso_steps = 8
+bucket_reso_steps = 16
 min_bucket_reso = 256
 max_bucket_reso = 1024
 
@@ -63,7 +67,7 @@ def run_test(test_name: str, cmd: list, timeout: int = 300) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=REPO_ROOT,
         )
 
         stdout = result.stdout
@@ -146,10 +150,9 @@ def main():
 
     # Common args for both scripts
     common_anima_args = [
-        "--dit_path", args.dit_path,
-        "--qwen3_path", args.qwen3_path,
-        "--vae_path", args.vae_path,
-        "--pretrained_model_name_or_path", args.dit_path,  # required by base parser
+        "--pretrained_model_name_or_path", args.dit_path,
+        "--qwen3", args.qwen3_path,
+        "--vae", args.vae_path,
         "--output_dir", output_dir,
         "--output_name", "test",
         "--dataset_config", toml_path,
@@ -193,6 +196,7 @@ def main():
             "--network_module", "networks.lora_anima",
             "--network_dim", "4",
             "--network_alpha", "1",
+            "--network_train_unet_only",
         ]
 
         cmd = [python, "anima_train_network.py"] + lora_args

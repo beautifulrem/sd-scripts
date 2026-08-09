@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKL
 
 from library import accelerator_setup
 from library.device_utils import clean_memory_on_device
@@ -118,7 +117,7 @@ def load_images_and_masks_for_caching(
 
 
 def cache_batch_latents(
-    vae: AutoencoderKL,
+    vae,
     cache_to_disk: bool,
     image_infos: List["ImageInfo"],
     flip_aug: bool,

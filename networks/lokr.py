@@ -8,13 +8,13 @@ import ast
 import math
 import os
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .network_base import ArchConfig, AdditionalNetwork, detect_arch_config, _parse_kv_pairs
+from .anima_network_base import AdditionalNetwork, get_anima_arch_config, _parse_kv_pairs
 from library.utils import setup_logging
 
 setup_logging()
@@ -400,7 +400,7 @@ def create_network(
     neuron_dropout: Optional[float] = None,
     **kwargs,
 ):
-    """Create a LoKr network. Called by train_network.py via network_module.create_network()."""
+    """Create a LoKr network for ``anima_train_network.py``."""
     if network_dim is None:
         network_dim = 4
     if network_alpha is None:
@@ -410,7 +410,7 @@ def create_network(
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
     # detect architecture
-    arch_config = detect_arch_config(unet, text_encoders)
+    arch_config = get_anima_arch_config(unet, text_encoders)
 
     # train LLM adapter
     train_llm_adapter = kwargs.get("train_llm_adapter", "false")
@@ -510,7 +510,7 @@ def create_network(
 
 
 def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weights_sd=None, for_inference=False, **kwargs):
-    """Create a LoKr network from saved weights. Called by train_network.py."""
+    """Create a LoKr network from saved Anima training weights."""
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
@@ -555,7 +555,7 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
     # detect architecture
-    arch_config = detect_arch_config(unet, text_encoders)
+    arch_config = get_anima_arch_config(unet, text_encoders)
 
     # extract factor for LoKr
     factor = int(kwargs.get("factor", -1))

@@ -102,7 +102,7 @@ def functional_pad(input, pad, mode="constant", value=None):
         return original_functional_pad(input, pad, mode=mode, value=value)
 
 
-# Diffusers FreeU
+# XPU FFT compatibility
 original_fft_fftn = torch.fft.fftn
 @wraps(torch.fft.fftn)
 def fft_fftn(input, s=None, dim=None, norm=None, *, out=None):
@@ -110,7 +110,7 @@ def fft_fftn(input, s=None, dim=None, norm=None, *, out=None):
     return original_fft_fftn(input.to(dtype=torch.float32), s=s, dim=dim, norm=norm, out=out).to(dtype=return_dtype)
 
 
-# Diffusers FreeU
+# XPU inverse-FFT compatibility
 original_fft_ifftn = torch.fft.ifftn
 @wraps(torch.fft.ifftn)
 def fft_ifftn(input, s=None, dim=None, norm=None, *, out=None):
@@ -118,7 +118,7 @@ def fft_ifftn(input, s=None, dim=None, norm=None, *, out=None):
     return original_fft_ifftn(input.to(dtype=torch.float32), s=s, dim=dim, norm=norm, out=out).to(dtype=return_dtype)
 
 
-# Diffusers Float64 (Alchemist GPUs doesn't support 64 bit):
+# Float64 compatibility for Alchemist GPUs:
 original_from_numpy = torch.from_numpy
 @wraps(torch.from_numpy)
 def from_numpy(ndarray):

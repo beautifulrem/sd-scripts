@@ -38,6 +38,7 @@ class ControlNetDataset(BaseDataset):
         max_bucket_reso: int,
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
+        bucket_free_fit: bool,
         train_inpainting: bool,
         debug_dataset: bool,
         validation_split: float,
@@ -99,6 +100,7 @@ class ControlNetDataset(BaseDataset):
             max_bucket_reso,
             bucket_reso_steps,
             bucket_no_upscale,
+            bucket_free_fit,
             1.0,
             train_inpainting,
             debug_dataset,
@@ -116,6 +118,13 @@ class ControlNetDataset(BaseDataset):
         self.validation_split = validation_split
         self.validation_seed = validation_seed
         self.resize_interpolation = resize_interpolation
+        self.subsets = self.dreambooth_dataset_delegate.subsets
+        self.enable_bucket = self.dreambooth_dataset_delegate.enable_bucket
+        self.min_bucket_reso = self.dreambooth_dataset_delegate.min_bucket_reso
+        self.max_bucket_reso = self.dreambooth_dataset_delegate.max_bucket_reso
+        self.bucket_reso_steps = self.dreambooth_dataset_delegate.bucket_reso_steps
+        self.bucket_no_upscale = self.dreambooth_dataset_delegate.bucket_no_upscale
+        self.bucket_free_fit = self.dreambooth_dataset_delegate.bucket_free_fit
 
         # assert all conditioning data exists
         missing_imgs = []
@@ -161,6 +170,18 @@ class ControlNetDataset(BaseDataset):
     def set_current_strategies(self):
         return self.dreambooth_dataset_delegate.set_current_strategies()
 
+    def enable_repa_features(self, suffix: str, key: str = "image_features") -> None:
+        self.repa_feature_suffix = suffix
+        self.repa_feature_key = key
+        self.dreambooth_dataset_delegate.repa_feature_suffix = suffix
+        self.dreambooth_dataset_delegate.repa_feature_key = key
+
+    def is_repa_feature_compatible(self) -> bool:
+        return all(
+            not subset.flip_aug and not subset.color_aug and not subset.random_crop
+            for subset in self.dreambooth_dataset_delegate.subsets
+        )
+
     def make_buckets(self):
         self.dreambooth_dataset_delegate.make_buckets()
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
@@ -191,7 +212,6 @@ class ControlNetDataset(BaseDataset):
 
             target_size_hw = example["target_sizes_hw"][i]
             original_size_hw = example["original_sizes_hw"][i]
-            crop_top_left = example["crop_top_lefts"][i]
             flipped = example["flippeds"][i]
             cond_img = load_image(image_info.cond_img_path)
 

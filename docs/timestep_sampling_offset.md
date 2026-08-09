@@ -16,7 +16,7 @@ Even at the same resolution, images with different semantic granularity benefit 
 - **Close-up / fine-detail images** (e.g. head shots, texture-heavy content): lower-noise emphasis lets the model focus on fine texture refinement.
 - **Full-body / macro-structure images**: higher-noise emphasis pushes the model to learn overall structure and composition from heavier corruption.
 
-For FLUX in particular, the model carries a strong photoreal prior. When fine-tuning on anime data, the model tends toward overly aggressive gradient updates. Applying a per-content noise offset smooths these update dynamics and stabilizes training.
+For Anima style training, a per-content offset can reduce conflicts between detail-focused and structure-focused subsets by changing which noise regions each subset emphasizes.
 
 ## Background
 
@@ -54,7 +54,7 @@ The offset is applied before the sigmoid transform, so the effect on the final s
 
 - Applies to `sigmoid`, `shift`, and `flux_shift` timestep sampling modes.
 - `uniform` and `sigma` (density-based) modes are not affected.
-- Currently consumed by `anima_train_network.py` and `flux_train_network.py`. Other trainers (SD3, Lumina, etc.) do not read this attribute; setting it for those trainers is a no-op.
+- Consumed by `anima_train_network.py` in this reduced checkout.
 - The offset is applied only during **training**. Validation uses unbiased sampling for comparable loss metrics.
 
 ## Understanding the offset
@@ -86,7 +86,7 @@ Note: when `sigmoid_scale ≠ 1.0`, the effective shift is `sigmoid_scale × off
 
 ### Interaction with `shift` / `flux_shift`
 
-In practice, FLUX is often trained with `shift` or `flux_shift`, and Anima with `shift` and `discrete_flow_shift = 3.0` (the same value used for Anima inference). These modes apply a monotonic warp after the sigmoid, so the baseline distribution is **already skewed toward high t** before any offset is applied: with `discrete_flow_shift = 3.0`, the no-offset mean is ≈0.714 and the median 0.750 (not 0.5 as in the figure above). `flux_shift` at 1024px resolution is equivalent to `shift ≈ 3.16`, giving a very similar shape.
+Anima commonly uses `shift` with `discrete_flow_shift = 3.0` (the same value used for Anima inference). The `shift` and `flux_shift` modes apply a monotonic warp after the sigmoid, so the baseline distribution is **already skewed toward high t** before any offset is applied: with `discrete_flow_shift = 3.0`, the no-offset mean is ≈0.714 and the median 0.750 (not 0.5 as in the figure above). `flux_shift` at 1024px resolution is equivalent to `shift ≈ 3.16`, giving a very similar shape.
 
 | offset | mean (shift = 3.0) | median (shift = 3.0) |
 |---|---|---|

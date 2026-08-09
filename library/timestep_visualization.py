@@ -8,7 +8,7 @@ which ``get_noisy_model_input_and_timesteps`` to call) lives in the per-model
 Typical use from a training script::
 
     if args.show_timesteps:
-        flux_train_utils.show_timesteps(args)  # builds the callables and calls show_timestep_distribution
+        anima_train_utils.show_timesteps(args)  # builds the callables and calls show_timestep_distribution
     else:
         trainer.train(args)
 """

@@ -1,7 +1,7 @@
 import argparse
 import datetime
 import gc
-from importlib.util import find_spec
+import importlib
 import random
 import os
 import time
@@ -13,23 +13,18 @@ import torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from tqdm import tqdm
-from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
 from library import (
     anima_models,
+    anima_inference_scheduler,
     anima_train_utils,
     anima_utils,
-    hunyuan_image_utils,
     qwen_image_autoencoder_kl,
     strategy_anima,
     strategy_base,
 )
 from library.device_utils import clean_memory_on_device, synchronize_device
-
-lycoris_available = find_spec("lycoris") is not None
-if lycoris_available:
-    from lycoris.kohya import create_network_from_weights
 
 from library.utils import setup_logging
 
@@ -47,7 +42,7 @@ class GenerationSettings:
 
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
-    parser = argparse.ArgumentParser(description="HunyuanImage inference script")
+    parser = argparse.ArgumentParser(description="Anima inference script")
 
     parser.add_argument("--dit", type=str, default=None, help="DiT directory or path")
     parser.add_argument("--vae", type=str, default=None, help="VAE directory or path")
@@ -77,6 +72,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
+    parser.add_argument(
+        "--adapter_module",
+        type=str,
+        default=None,
+        help="Full custom Anima adapter module, for example networks.flow_map_lora_anima.",
+    )
+    parser.add_argument("--adapter_weight", type=str, default=None, help="Checkpoint for --adapter_module.")
+    parser.add_argument("--adapter_multiplier", type=float, default=1.0)
 
     # inference
     parser.add_argument(
@@ -120,10 +123,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument(
-        "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
-    )
-
     # arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
@@ -133,13 +132,12 @@ def parse_args() -> argparse.Namespace:
     # Validate arguments
     if args.from_file and args.interactive:
         raise ValueError("Cannot use both --from_file and --interactive at the same time")
+    if (args.adapter_module is None) != (args.adapter_weight is None):
+        raise ValueError("--adapter_module and --adapter_weight must be specified together")
 
     if args.latent_path is None or len(args.latent_path) == 0:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
-
-    if args.lycoris and not lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
@@ -245,14 +243,10 @@ def load_dit_model(
     Returns:
         anima_models.Anima: DiT model instance
     """
-    # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
-
-    loading_device = "cpu"
-    if not args.lycoris:
-        loading_device = device
+    loading_device = device
 
     # load LoRA weights
-    if not args.lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
+    if args.lora_weight is not None and len(args.lora_weight) > 0:
         lora_weights_list = []
         for lora_weight in args.lora_weight:
             logger.info(f"Loading LoRA weight from: {lora_weight}")
@@ -264,7 +258,7 @@ def load_dit_model(
         lora_weights_list = None
 
     loading_weight_dtype = dit_weight_dtype
-    if args.fp8_scaled and not args.lycoris:
+    if args.fp8_scaled:
         loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
 
     model = anima_utils.load_anima_model(
@@ -274,7 +268,7 @@ def load_dit_model(
         True,  # enable split_attn to trim masked tokens
         loading_device,
         loading_weight_dtype,
-        args.fp8_scaled and not args.lycoris,
+        args.fp8_scaled,
         lora_weights_list=lora_weights_list,
         lora_multipliers=args.lora_multiplier,
     )
@@ -292,6 +286,31 @@ def load_dit_model(
 
     # model.to(device)
     model.to(device, dtype=torch.bfloat16)  # ensure model is in bfloat16 for inference
+
+    if args.adapter_module is not None:
+        logger.info(f"Loading full Anima adapter {args.adapter_module} from {args.adapter_weight}")
+        adapter_module = importlib.import_module(args.adapter_module)
+        adapter, adapter_state = adapter_module.create_network_from_weights(
+            args.adapter_multiplier,
+            args.adapter_weight,
+            None,
+            [],
+            model,
+            for_inference=True,
+        )
+        if hasattr(adapter, "set_condition_latents"):
+            raise ValueError(
+                "EasyControl full-adapter inference requires condition-latent preparation and is not supported by "
+                "anima_minimal_inference.py; use the ControlNet-style training sampler"
+            )
+        adapter.apply_to([], model, apply_text_encoder=False, apply_unet=True)
+        incompatible = adapter.load_state_dict(adapter_state, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(f"custom adapter checkpoint mismatch: {incompatible}")
+        adapter.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+        # Adapter hooks use weak references so the standalone model must own a
+        # non-registered strong reference for the duration of inference.
+        object.__setattr__(model, "_anima_external_adapter", adapter)
 
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
@@ -484,7 +503,7 @@ def generate(
         precomputed_text_data: Optional dictionary with precomputed text data
 
     Returns:
-        tuple: (HunyuanVAE2D model (vae) or None, torch.Tensor generated latent)
+        tuple: (Anima Qwen-Image VAE or None, generated latent tensor)
     """
     device, dit_weight_dtype = (gen_settings.device, gen_settings.dit_weight_dtype)
 
@@ -549,7 +568,7 @@ def generate_body(
         height // 8,  # qwen_image_autoencoder_kl.SCALE_FACTOR,
         width // 8,  # qwen_image_autoencoder_kl.SCALE_FACTOR,
     )
-    latents = randn_tensor(shape, generator=seed_g, device=device, dtype=torch.bfloat16)
+    latents = torch.randn(shape, generator=seed_g, device=device, dtype=torch.bfloat16)
 
     # Create padding mask
     bs = latents.shape[0]
@@ -562,7 +581,7 @@ def generate_body(
     negative_embed = negative_embed.to(torch.bfloat16)
 
     # Prepare timesteps
-    timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
+    timesteps, sigmas = anima_inference_scheduler.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
     timesteps /= 1000  # scale to [0,1] range
     timesteps = timesteps.to(device, dtype=torch.bfloat16)
 
@@ -574,16 +593,35 @@ def generate_body(
         for i, t in enumerate(timesteps):
             t_expand = t.expand(latents.shape[0])
 
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                noise_pred = anima(latents, t_expand, embed, padding_mask=padding_mask)
+            adapter = getattr(anima, "_anima_external_adapter", None)
+            if adapter is not None and hasattr(adapter, "set_step_sigmas"):
+                adapter.set_step_sigmas(t_expand)
+            if adapter is not None and hasattr(adapter, "set_frequency_context"):
+                adapter.set_frequency_context(t_expand, latents)
+            if adapter is not None and hasattr(adapter, "set_flow_interval"):
+                next_sigma = sigmas[i + 1].to(device=device, dtype=t_expand.dtype).expand_as(t_expand)
+                adapter.set_flow_interval(t_expand, next_sigma)
 
-            if do_cfg:
+            try:
                 with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-                    uncond_noise_pred = anima(latents, t_expand, negative_embed, padding_mask=padding_mask)
-                noise_pred = uncond_noise_pred + args.guidance_scale * (noise_pred - uncond_noise_pred)
+                    noise_pred = anima(latents, t_expand, embed, padding_mask=padding_mask)
+
+                if do_cfg:
+                    with torch.no_grad(), torch.autocast(
+                        device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled
+                    ):
+                        uncond_noise_pred = anima(latents, t_expand, negative_embed, padding_mask=padding_mask)
+                    noise_pred = uncond_noise_pred + args.guidance_scale * (noise_pred - uncond_noise_pred)
+            finally:
+                if adapter is not None and hasattr(adapter, "clear_step_sigmas"):
+                    adapter.clear_step_sigmas()
+                if adapter is not None and hasattr(adapter, "clear_frequency_context"):
+                    adapter.clear_frequency_context()
+                if adapter is not None and hasattr(adapter, "clear_flow_interval"):
+                    adapter.clear_flow_interval()
 
             # ensure latents dtype is consistent
-            latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
+            latents = anima_inference_scheduler.step(latents, noise_pred, sigmas, i).to(latents.dtype)
 
             pbar.update()
 

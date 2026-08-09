@@ -9,7 +9,7 @@ Verifies, end-to-end on CPU:
   6. save_lllite_model -> reload into a fresh LLLite -> state_dicts match
 
 Run:
-    python tests/manual_test_anima_lllite_dryrun.py
+    python tools/dev/manual_test_anima_lllite_dryrun.py
 """
 
 import os
@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # repo root on sys.path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from library.anima_models import Attention  # real Anima Attention
 from networks.control_net_lllite_anima import (

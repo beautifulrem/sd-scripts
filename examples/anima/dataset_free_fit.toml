@@ -1,0 +1,18 @@
+[[datasets]]
+resolution = [1024, 1024]
+batch_size = 1
+enable_bucket = true
+bucket_free_fit = true
+bucket_reso_steps = 16
+min_bucket_reso = 256
+max_bucket_reso = 2048
+
+  [[datasets.subsets]]
+  image_dir = "/path/to/images"
+  num_repeats = 1
+  caption_extension = ".txt"
+  shuffle_caption = false
+  flip_aug = false
+  color_aug = false
+  random_crop = false
+

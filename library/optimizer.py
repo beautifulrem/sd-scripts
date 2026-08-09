@@ -4,9 +4,7 @@ Hosts the unified optimizer dispatcher (``get_optimizer``) covering AdamW /
 8-bit / Lion / DAdaptation / Prodigy / Adafactor / schedule-free / arbitrary
 ``module.Class`` forms; the schedule-free helpers (``is_schedulefree_optimizer``,
 ``get_optimizer_train_eval_fn``, ``get_dummy_scheduler``); the LR scheduler
-factory (``get_scheduler_fix``); and the LR-logging helpers
-(``append_lr_to_logs``, ``append_lr_to_logs_with_names``). Extracted from
-``library.train_util`` and re-exported there for backward compatibility.
+factory (``get_scheduler_fix``); and Anima LR logging.
 """
 
 import argparse
@@ -17,10 +15,6 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 import transformers
-from diffusers.optimization import (
-    SchedulerType as DiffusersSchedulerType,
-    TYPE_TO_SCHEDULER_FUNCTION as DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION,
-)
 from torch.optim import Optimizer
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 
@@ -81,6 +75,13 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             #     value = tuple(value)
 
             optimizer_kwargs[key] = value
+
+    if getattr(args, "fused_adamw", False):
+        if optimizer_type != "adamw":
+            raise ValueError("--fused_adamw requires --optimizer_type AdamW (or the default optimizer)")
+        if "fused" in optimizer_kwargs and optimizer_kwargs["fused"] is not True:
+            raise ValueError("--fused_adamw conflicts with optimizer_args fused=False")
+        optimizer_kwargs["fused"] = True
     # logger.info(f"optkwargs {optimizer}_{kwargs}")
 
     lr = args.learning_rate
@@ -467,8 +468,7 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     return DummyScheduler(optimizer)
 
 
-# Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
-# Add some checking and features to the original function.
+# Learning-rate scheduler factory with Anima training checks.
 
 
 def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
@@ -526,11 +526,6 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         initial_lr = float(name.split(":")[1])
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
         return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
-
-    if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
-        name = DiffusersSchedulerType(name)
-        schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
@@ -606,17 +601,6 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         num_decay_steps=num_decay_steps,
         **lr_scheduler_kwargs,
     )
-
-
-def append_lr_to_logs(logs, lr_scheduler, optimizer_type, including_unet=True):
-    names = []
-    if including_unet:
-        names.append("unet")
-    names.append("text_encoder1")
-    names.append("text_encoder2")
-    names.append("text_encoder3")  # SD3
-
-    append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
 
 
 def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):

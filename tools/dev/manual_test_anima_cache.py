@@ -16,7 +16,6 @@ The image_dir should contain pairs of:
 """
 
 import argparse
-import glob
 import os
 import sys
 import traceback
@@ -252,7 +251,6 @@ def test_text_encoder_cache(args, pairs):
     print_tensor_info("t5_attn_mask_np", t5_mask_np)
 
     if args.cache_to_disk:
-        npz_path = os.path.join(args.image_dir, "_test_te_cache.npz")
         # Save per-sample (simulating cache_batch_outputs)
         for i in range(len(captions)):
             sample_npz = os.path.splitext(pairs[i][0])[0] + "_test_te.npz"

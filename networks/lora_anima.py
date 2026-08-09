@@ -1,8 +1,10 @@
 # LoRA network module for Anima
 import ast
+import contextlib
 import math
 import os
 import re
+import weakref
 from typing import Dict, List, Optional, Tuple, Type, Union
 import torch
 from library.utils import setup_logging
@@ -28,6 +30,11 @@ class LoRAModule(torch.nn.Module):
         dropout=None,
         rank_dropout=None,
         module_dropout=None,
+        down_init="kaiming",
+        use_timestep_mask=False,
+        min_rank=1,
+        alpha_rank_scale=1.0,
+        channel_scale=None,
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -54,8 +61,29 @@ class LoRAModule(torch.nn.Module):
             self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
             self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        if down_init == "kaiming" or isinstance(self.lora_down, torch.nn.Conv2d):
+            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        elif down_init == "weight_svd":
+            self._init_down_weight_svd(org_module)
+        else:
+            raise ValueError(f"Unsupported LoRA down_init: {down_init!r}")
         torch.nn.init.zeros_(self.lora_up.weight)
+
+        self._has_channel_scale = False
+        if channel_scale is not None:
+            if not isinstance(self.lora_down, torch.nn.Linear):
+                raise ValueError("channel scaling supports Linear LoRA modules only")
+            channel_scale = channel_scale.detach().float().clamp_min(1e-6)
+            if channel_scale.ndim != 1 or channel_scale.shape[0] != self.lora_down.in_features:
+                raise ValueError(
+                    f"channel scale shape {tuple(channel_scale.shape)} does not match "
+                    f"{self.lora_down.in_features} input channels"
+                )
+            channel_scale = channel_scale / channel_scale.mean().clamp_min(1e-12)
+            with torch.no_grad():
+                self.lora_down.weight.mul_(channel_scale.to(self.lora_down.weight).unsqueeze(0))
+            self.register_buffer("inv_scale", (1.0 / channel_scale).contiguous(), persistent=True)
+            self._has_channel_scale = True
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
@@ -69,22 +97,111 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self.enabled = True
+        self.use_timestep_mask = bool(use_timestep_mask)
+        self.min_rank = int(min_rank)
+        self.alpha_rank_scale = float(alpha_rank_scale)
+        if not 1 <= self.min_rank <= self.lora_dim:
+            raise ValueError(f"min_rank must be in [1, {self.lora_dim}], got {self.min_rank}")
+        if self.alpha_rank_scale <= 0:
+            raise ValueError(f"alpha_rank_scale must be positive, got {self.alpha_rank_scale}")
+        self.register_buffer("_timestep_rank_mask", torch.empty(0), persistent=False)
+
+    def _init_down_weight_svd(self, org_module: torch.nn.Module) -> None:
+        """Initialize a Linear LoRA input basis from the frozen weight's top right singular vectors.
+
+        The up projection remains zero, so the adapter's initial delta is exactly zero and
+        the checkpoint stays a conventional LoRA checkpoint.
+        """
+
+        if not isinstance(org_module, torch.nn.Linear):
+            raise TypeError("weight_svd initialization currently supports Linear layers only")
+
+        weight = org_module.weight.detach().float()
+        max_rank = min(weight.shape)
+        if self.lora_dim > max_rank:
+            raise ValueError(
+                f"LoRA rank {self.lora_dim} exceeds the source weight rank bound {max_rank} for {self.lora_name}"
+            )
+
+        # A low-rank randomized SVD avoids allocating the full singular-vector matrices of
+        # Anima's wide 2K/6K Linear layers. A small oversampling margin is sufficient for
+        # an initialization basis; both LoRA factors remain trainable afterwards.
+        q = min(self.lora_dim + 6, max_rank)
+        _, _, right_vectors = torch.svd_lowrank(weight, q=q, niter=2)
+        basis = right_vectors[:, : self.lora_dim].T / math.sqrt(3.0)
+        self.lora_down.weight.data.copy_(basis.to(self.lora_down.weight))
+
+    def set_timestep_mask(self, sigmas: torch.Tensor) -> None:
+        if not self.use_timestep_mask:
+            return
+        sigma = sigmas.detach().float().flatten().clamp_(0.0, 1.0)
+        fraction = (1.0 - sigma).pow(self.alpha_rank_scale)
+        active_rank = self.min_rank + torch.floor(fraction * (self.lora_dim - self.min_rank)).to(torch.long)
+        active_rank = active_rank.clamp_(self.min_rank, self.lora_dim)
+        columns = torch.arange(self.lora_dim, device=sigma.device).unsqueeze(0)
+        self._timestep_rank_mask = (columns < active_rank.unsqueeze(1)).to(dtype=torch.float32)
+
+    def clear_timestep_mask(self) -> None:
+        self._timestep_rank_mask = torch.empty(0, device=self._timestep_rank_mask.device)
+
+    def capture_recompute_context(self):
+        """Snapshot external adapter state used inside checkpointed blocks."""
+        if self._timestep_rank_mask.numel() == 0 and self.enabled:
+            return None
+        return self._timestep_rank_mask, self.enabled
+
+    def restore_recompute_context(self, state) -> None:
+        if state is None:
+            self.clear_timestep_mask()
+            self.enabled = True
+            return
+        self._timestep_rank_mask, self.enabled = state
+
+    def _apply_timestep_mask(self, lx: torch.Tensor) -> torch.Tensor:
+        if not self.use_timestep_mask or self._timestep_rank_mask.numel() == 0:
+            return lx
+        if self._timestep_rank_mask.shape[0] not in (1, lx.shape[0]):
+            raise RuntimeError(
+                f"T-LoRA mask batch {self._timestep_rank_mask.shape[0]} does not match activation batch {lx.shape[0]}"
+            )
+        mask = self._timestep_rank_mask.to(device=lx.device, dtype=lx.dtype)
+        if isinstance(self.lora_down, torch.nn.Conv2d):
+            mask = mask[:, :, None, None]
+        else:
+            for _ in range(lx.ndim - 2):
+                mask = mask.unsqueeze(1)
+        return lx * mask
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
+        # Projection fusion evaluates this adapter residual separately while
+        # keeping the frozen base Q/K/V projections in one GEMM. A weakref avoids
+        # registering this module a second time below the original Linear.
+        self.org_module._anima_lora_ref = weakref.ref(self)
         self.org_module.forward = self.forward
 
         del self.org_module
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
+        if not self.enabled:
+            return org_forwarded
+        return org_forwarded + self.forward_delta(x)
+
+    def forward_delta(self, x):
+        """Return only the LoRA residual, preserving all training dropouts."""
 
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
-                return org_forwarded
+                if isinstance(self.lora_up, torch.nn.Linear):
+                    return torch.zeros((*x.shape[:-1], self.lora_up.out_features), device=x.device, dtype=x.dtype)
+                return self.lora_up(self.lora_down(x)) * 0
 
-        lx = self.lora_down(x)
+        x_lora = x * self.inv_scale.to(device=x.device, dtype=x.dtype) if self._has_channel_scale else x
+        lx = self.lora_down(x_lora)
+        lx = self._apply_timestep_mask(lx)
 
         # normal dropout
         if self.dropout is not None and self.training:
@@ -110,7 +227,7 @@ class LoRAModule(torch.nn.Module):
 
         lx = self.lora_up(lx)
 
-        return org_forwarded + lx * self.multiplier * scale
+        return lx * self.multiplier * scale
 
     @property
     def device(self):
@@ -237,6 +354,36 @@ def create_network(
     if network_alpha is None:
         network_alpha = 1.0
 
+    down_init = kwargs.get("down_init", "kaiming")
+    if down_init not in ("kaiming", "weight_svd"):
+        raise ValueError("down_init must be either 'kaiming' or 'weight_svd'")
+
+    use_timestep_mask = str(kwargs.get("use_timestep_mask", "false")).lower() == "true"
+    min_rank = int(kwargs.get("min_rank", 1))
+    alpha_rank_scale = float(kwargs.get("alpha_rank_scale", 1.0))
+    if not use_timestep_mask and ("min_rank" in kwargs or "alpha_rank_scale" in kwargs):
+        raise ValueError("min_rank/alpha_rank_scale require use_timestep_mask=true")
+
+    channel_scaling_alpha = float(kwargs.get("channel_scaling_alpha", 0.0) or 0.0)
+    channel_scaling_stats = kwargs.get("channel_scaling_stats", None)
+    if not 0.0 <= channel_scaling_alpha <= 1.0:
+        raise ValueError("channel_scaling_alpha must be in [0, 1]")
+    channel_scales = None
+    if channel_scaling_alpha > 0:
+        if not channel_scaling_stats:
+            raise ValueError("channel_scaling_alpha > 0 requires channel_scaling_stats=<safetensors path>")
+        from safetensors.torch import load_file
+
+        raw_channel_stats = load_file(str(channel_scaling_stats))
+        channel_scales = {
+            name: values.float().clamp_min(1e-6).pow(channel_scaling_alpha)
+            for name, values in raw_channel_stats.items()
+        }
+        logger.info(
+            f"Loaded channel calibration for {len(channel_scales)} modules from {channel_scaling_stats} "
+            f"(alpha={channel_scaling_alpha})"
+        )
+
     # train LLM adapter
     train_llm_adapter = kwargs.get("train_llm_adapter", "false")
     if train_llm_adapter is not None:
@@ -259,6 +406,13 @@ def create_network(
         include_patterns = ast.literal_eval(include_patterns)
         if not isinstance(include_patterns, list):
             include_patterns = [include_patterns]
+
+    train_adaln = str(kwargs.get("train_adaln", "false")).lower() == "true"
+    adaln_rank = kwargs.get("adaln_rank", None)
+    adaln_alpha = kwargs.get("adaln_alpha", None)
+    adaln_lr = kwargs.get("adaln_lr", None)
+    if not train_adaln and any(value is not None for value in (adaln_rank, adaln_alpha, adaln_lr)):
+        raise ValueError("adaln_rank/adaln_alpha/adaln_lr require train_adaln=true")
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -307,6 +461,28 @@ def create_network(
     else:
         reg_dims = None
 
+    network_reg_alphas = kwargs.get("network_reg_alphas", None)
+    if network_reg_alphas is not None:
+        reg_alphas = parse_kv_pairs(network_reg_alphas, is_int=False)
+    else:
+        reg_alphas = None
+
+    if train_adaln:
+        adaln_pattern = r".*adaln_modulation_.*"
+        include_patterns = list(include_patterns or [])
+        if adaln_pattern not in include_patterns:
+            include_patterns.append(adaln_pattern)
+        reg_dims = dict(reg_dims or {})
+        reg_alphas = dict(reg_alphas or {})
+        reg_lrs = dict(reg_lrs or {})
+        # Explicit user regex entries retain precedence because module selection uses
+        # insertion order and these Anima-specific defaults are appended last.
+        reg_dims.setdefault(adaln_pattern, int(adaln_rank) if adaln_rank is not None else min(16, network_dim))
+        if adaln_alpha is not None:
+            reg_alphas.setdefault(adaln_pattern, float(adaln_alpha))
+        if adaln_lr is not None:
+            reg_lrs.setdefault(adaln_pattern, float(adaln_lr))
+
     network = LoRANetwork(
         text_encoders,
         unet,
@@ -320,7 +496,13 @@ def create_network(
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
         reg_dims=reg_dims,
+        reg_alphas=reg_alphas,
         reg_lrs=reg_lrs,
+        down_init=down_init,
+        use_timestep_mask=use_timestep_mask,
+        min_rank=min_rank,
+        alpha_rank_scale=alpha_rank_scale,
+        channel_scales=channel_scales,
         verbose=verbose,
     )
 
@@ -404,7 +586,13 @@ class LoRANetwork(torch.nn.Module):
         exclude_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
         reg_dims: Optional[Dict[str, int]] = None,
+        reg_alphas: Optional[Dict[str, float]] = None,
         reg_lrs: Optional[Dict[str, float]] = None,
+        down_init: str = "kaiming",
+        use_timestep_mask: bool = False,
+        min_rank: int = 1,
+        alpha_rank_scale: float = 1.0,
+        channel_scales: Optional[Dict[str, torch.Tensor]] = None,
         verbose: Optional[bool] = False,
     ) -> None:
         super().__init__()
@@ -416,7 +604,13 @@ class LoRANetwork(torch.nn.Module):
         self.module_dropout = module_dropout
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
+        self.reg_alphas = reg_alphas
         self.reg_lrs = reg_lrs
+        self.down_init = down_init
+        self.use_timestep_mask = use_timestep_mask
+        self.min_rank = min_rank
+        self.alpha_rank_scale = alpha_rank_scale
+        self.channel_scales = channel_scales
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -501,6 +695,15 @@ class LoRANetwork(torch.nn.Module):
                                         dim = default_dim if default_dim is not None else self.lora_dim
                                         alpha_val = self.alpha
 
+                                if self.reg_alphas is not None:
+                                    for reg, configured_alpha in self.reg_alphas.items():
+                                        if re.fullmatch(reg, original_name):
+                                            alpha_val = configured_alpha
+                                            logger.info(
+                                                f"Module {original_name} matched with regex '{reg}' -> alpha: {alpha_val}"
+                                            )
+                                            break
+
                             if dim is None or dim == 0:
                                 if is_linear or is_conv2d_1x1:
                                     skipped.append(lora_name)
@@ -515,6 +718,15 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
+                                down_init=self.down_init,
+                                use_timestep_mask=self.use_timestep_mask,
+                                min_rank=min(self.min_rank, dim),
+                                alpha_rank_scale=self.alpha_rank_scale,
+                                channel_scale=(
+                                    None
+                                    if not is_unet or self.channel_scales is None
+                                    else self.channel_scales.get(lora_name, self.channel_scales.get(original_name))
+                                ),
                             )
                             lora.original_name = original_name
                             loras.append(lora)
@@ -566,6 +778,36 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.multiplier = self.multiplier
 
+    def set_timestep_mask(self, sigmas: torch.Tensor) -> None:
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.set_timestep_mask(sigmas)
+
+    def clear_timestep_mask(self) -> None:
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.clear_timestep_mask()
+
+    def capture_recompute_context(self):
+        states = tuple(lora.capture_recompute_context() for lora in self.text_encoder_loras + self.unet_loras)
+        return None if all(state is None for state in states) else states
+
+    def restore_recompute_context(self, states) -> None:
+        loras = self.text_encoder_loras + self.unet_loras
+        if states is None:
+            states = (None,) * len(loras)
+        if len(states) != len(loras):
+            raise RuntimeError("Anima adapter checkpoint context does not match the active LoRA modules")
+        for lora, state in zip(loras, states):
+            lora.restore_recompute_context(state)
+
+    @contextlib.contextmanager
+    def use_recompute_context(self, states):
+        previous = self.capture_recompute_context()
+        self.restore_recompute_context(states)
+        try:
+            yield
+        finally:
+            self.restore_recompute_context(previous)
+
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
@@ -579,6 +821,12 @@ class LoRANetwork(torch.nn.Module):
             weights_sd = torch.load(file, map_location="cpu")
 
         info = self.load_state_dict(weights_sd, False)
+        # Standard files have inv_scale baked into lora_down. Re-absorb the
+        # calibration when resuming an internally channel-scaled run.
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if getattr(lora, "_has_channel_scale", False) and f"{lora.lora_name}.inv_scale" not in weights_sd:
+                with torch.no_grad():
+                    lora.lora_down.weight.div_(lora.inv_scale.to(lora.lora_down.weight).unsqueeze(0))
         return info
 
     def apply_to(self, text_encoders, unet, apply_text_encoder=True, apply_unet=True):
@@ -595,6 +843,12 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.apply_to()
             self.add_module(lora.lora_name, lora)
+
+        if apply_unet and hasattr(unet, "blocks"):
+            provider_ref = weakref.ref(self)
+            unet._anima_adapter_network = provider_ref
+            for block in unet.blocks:
+                block._anima_adapter_context_provider = provider_ref
 
     def is_mergeable(self):
         return True
@@ -748,7 +1002,18 @@ class LoRANetwork(torch.nn.Module):
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
-        state_dict = self.state_dict()
+        state_dict = {key: value.detach().clone() for key, value in self.state_dict().items()}
+        # Bake the SmoothQuant reparameterization into ordinary lora_down
+        # weights and omit calibration buffers. The file remains a standard
+        # Anima LoRA for ComfyUI and existing loaders.
+        for key in list(state_dict):
+            if not key.endswith(".inv_scale"):
+                continue
+            prefix = key[: -len(".inv_scale")]
+            down_key = f"{prefix}.lora_down.weight"
+            inv_scale = state_dict.pop(key)
+            if down_key in state_dict:
+                state_dict[down_key].mul_(inv_scale.to(state_dict[down_key]).unsqueeze(0))
 
         if dtype is not None:
             for key in list(state_dict.keys()):
@@ -758,7 +1023,7 @@ class LoRANetwork(torch.nn.Module):
 
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
-            import library.model_io as model_io
+            import library.anima_model_io as model_io
 
             if metadata is None:
                 metadata = {}

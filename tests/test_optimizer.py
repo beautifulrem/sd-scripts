@@ -1,20 +1,20 @@
 from unittest.mock import patch
-from library.optimizer import get_optimizer
-from train_network import setup_parser
-import torch
-from torch.nn import Parameter
 
 # Optimizer libraries
 import bitsandbytes as bnb
-from lion_pytorch import lion_pytorch
-import schedulefree
-
 import dadaptation
 import dadaptation.experimental as dadapt_experimental
-
 import prodigyopt
+import pytest
+import schedulefree
 import schedulefree as sf
+import torch
 import transformers
+from lion_pytorch import lion_pytorch
+from torch.nn import Parameter
+
+from library.anima_network_trainer import setup_parser
+from library.optimizer import get_optimizer
 
 
 def test_default_get_optimizer():
@@ -41,6 +41,25 @@ def test_get_schedulefree_optimizer():
         assert optimizer_name == "schedulefree.adamw_schedulefree.AdamWScheduleFree"
         assert optimizer_args == ""
         assert isinstance(optimizer, schedulefree.adamw_schedulefree.AdamWScheduleFree)
+
+
+def test_fused_adamw_flag_enables_torch_fused_optimizer():
+    with patch("sys.argv", ["", "--fused_adamw"]):
+        args = setup_parser().parse_args()
+        param = Parameter(torch.tensor([1.5, 1.5]))
+        optimizer_name, optimizer_args, optimizer = get_optimizer(args, [param])
+
+        assert optimizer_name == "torch.optim.adamw.AdamW"
+        assert "fused=True" in optimizer_args
+        assert optimizer.defaults["fused"] is True
+
+
+def test_fused_adamw_rejects_incompatible_optimizer():
+    with patch("sys.argv", ["", "--optimizer_type", "AdamW8bit", "--fused_adamw"]):
+        args = setup_parser().parse_args()
+        param = Parameter(torch.tensor([1.5, 1.5]))
+        with pytest.raises(ValueError, match="requires --optimizer_type AdamW"):
+            get_optimizer(args, [param])
 
 
 def test_all_supported_optimizers():

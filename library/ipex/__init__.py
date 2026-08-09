@@ -222,12 +222,7 @@ def ipex_init(): # pylint: disable=too-many-statements
             torch.cuda.ipc_collect = return_none
             torch.cuda.utilization = return_zero
 
-            device_supports_fp64 = ipex_hijacks()
-            try:
-                from .diffusers import ipex_diffusers
-                ipex_diffusers(device_supports_fp64=device_supports_fp64)
-            except Exception: # pylint: disable=broad-exception-caught
-                pass
+            ipex_hijacks()
             torch.cuda.is_xpu_hijacked = True
     except Exception as e:
         return False, e

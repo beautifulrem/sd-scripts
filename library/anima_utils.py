@@ -4,7 +4,6 @@ import os
 from typing import Dict, List, Optional, Union
 import torch
 from safetensors.torch import load_file, save_file
-from accelerate.utils import set_module_tensor_to_device  # kept for potential future use
 from accelerate import init_empty_weights
 
 from library.fp8_optimization_utils import apply_fp8_monkey_patch

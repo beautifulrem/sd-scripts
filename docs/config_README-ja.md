@@ -110,6 +110,7 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 | ---- | ---- | ---- | ---- |
 | `batch_size` | `1` | o | o |
 | `bucket_no_upscale` | `true` | o | o |
+| `bucket_free_fit` | `true` | o | o |
 | `bucket_reso_steps` | `64` | o | o |
 | `enable_bucket` | `true` | o | o |
 | `max_bucket_reso` | `1024` | o | o |

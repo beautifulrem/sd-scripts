@@ -17,7 +17,7 @@ from typing import List
 import toml
 from accelerate import Accelerator
 
-from library.args import get_sanitized_config_or_none
+from library.anima_args import get_sanitized_config_or_none
 from library.utils import setup_logging
 
 setup_logging()
@@ -43,7 +43,7 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
         )
 
         if "wandb" in [tracker.name for tracker in accelerator.trackers]:
-            import wandb
+            import wandb  # noqa: F401 -- ensures the optional tracker is importable
 
             wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
 
