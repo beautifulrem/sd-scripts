@@ -11,6 +11,7 @@ def apply_masked_loss(
     batch: dict,
     *,
     conditioning_image_is_mask: bool = True,
+    normalize: bool = False,
 ) -> torch.Tensor:
     if batch.get("alpha_masks") is not None:
         mask = batch["alpha_masks"].to(dtype=loss.dtype).unsqueeze(1)
@@ -20,7 +21,11 @@ def apply_masked_loss(
     else:
         return loss
     mask = torch.nn.functional.interpolate(mask, size=loss.shape[2:], mode="area")
-    return loss * mask
+    masked_loss = loss * mask
+    if normalize:
+        mask_mean = mask.mean(dim=tuple(range(1, mask.ndim)), keepdim=True).clamp(min=1e-6)
+        masked_loss = masked_loss / mask_mean
+    return masked_loss
 
 
 def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler) -> Optional[torch.Tensor]:

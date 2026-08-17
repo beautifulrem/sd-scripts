@@ -13,6 +13,8 @@ The current implementation is the **v2 architecture**, adapted specifically for 
 * an optional **ASPP** (Atrous Spatial Pyramid Pooling) tail in `conditioning1`, switchable via `--lllite_use_aspp`.
 
 > **Status:** experimental. Currently supports image generation only (`T=1`). `--blocks_to_swap`, `--cpu_offload_checkpointing`, `--unsloth_offload_checkpointing`, `--deepspeed`, and `--fused_backward_pass` are not yet supported and the training script will assert if any of them is enabled.
+>
+> The `remi` branch also isolates the draft latent-conditioning experiment from [sd-scripts PR #2412](https://github.com/kohya-ss/sd-scripts/pull/2412). Pixel input remains the default and preserves v2 checkpoints. `--lllite_cond_input=latent` VAE-encodes the control image and uses a separate v2.1 stem; checkpoints record the input space and reject pixel/latent mismatches. No semantic trunk is included. The upstream author reported faster convergence on one expression-edit dataset but about 12% slower steps; treat that as a hypothesis, not a general result.
 
 An experimental ComfyUI ControlNet-LLLite node for Anima is also available [here](https://github.com/kohya-ss/ComfyUI-Anima-LLLite).
 
@@ -32,6 +34,8 @@ ControlNet-LLLite は LoRA ライクな軽量条件付け手法です。Anima �
 * `conditioning1` 末尾に **ASPP** (Atrous Spatial Pyramid Pooling) を任意で挿入できる `--lllite_use_aspp` を追加しました。
 
 > **ステータス:** 実験的実装です。現状は画像生成（`T=1`）のみ対応しています。`--blocks_to_swap` / `--cpu_offload_checkpointing` / `--unsloth_offload_checkpointing` / `--deepspeed` / `--fused_backward_pass` には未対応で、指定すると学習スクリプトが assert で停止します。
+
+`remi` では PR #2412 の latent conditioning 部分だけを semantic trunk から分離しています。既定の `pixel` は v2 互換、`--lllite_cond_input=latent` は Qwen VAE の 16ch latent を別の v2.1 stem に入力します。入力空間は重み metadata に保存され、pixel/latent の取り違えは load 時に拒否されます。単一データセットで報告された収束短縮と約 12% の step 低速化は、固定条件 CUDA A/B で再検証するまでは一般化しません。
 
 実験的なComfyUI用のControlNet-LLLiteノードも [こちら](https://github.com/kohya-ss/ComfyUI-Anima-LLLite) で公開しています。
 
@@ -158,6 +162,11 @@ The following options are unique to this script. Anima-related arguments (`--qwe
 
 * `--lllite_cond_dim=<int>` (default `64`)
   * Internal trunk channel width of `conditioning1`. The two stride-4 convs progress as `3 → cond_dim/2 → cond_dim`, ResBlocks (and optional ASPP) operate at this width, and a final 1×1 conv squeezes back to `cond_emb_dim`. Acts as a separate capacity knob from `--cond_emb_dim`.
+
+* `--lllite_cond_input=pixel|latent` (default `pixel`)
+  * `pixel` is the existing v2 path and should be used for old checkpoints and the baseline arm of an experiment.
+  * `latent` encodes each control image with the Qwen-Image VAE, feeds the resulting 16-channel latent to a separate v2.1 stem, and keeps the VAE resident during training. This adds VAE encode time to every step; target-latent caching does not cache control latents.
+  * In latent inpainting mode, the RGB control is VAE-encoded while the binary mask follows a separate learned pyramid. The two are joined inside the stem.
 
 * `--lllite_cond_resblocks=<int>` (default `1`)
   * Number of pre-activation `(GN→SiLU→Conv3×3→GN→SiLU→Conv3×3 + skip)` ResBlocks inserted in `conditioning1` after the stride-16 stack. Increasing this widens the receptive field of the shared conditioning embedding. `0` disables ResBlocks entirely. Since `conditioning1` is computed once per step (and once per inference call), making it deeper costs essentially nothing at inference time.
@@ -352,6 +361,7 @@ The metadata records `modelspec.architecture = "anima-preview/control-net-lllite
 | `lllite.mlp_dim` | per-module MLP / FiLM hidden dim |
 | `lllite.target_layers` | the user-supplied `--lllite_target_layers` string verbatim |
 | `lllite.target_atomics` | resolved canonical atomic specifier list (comma-separated) |
+| `lllite.cond_input_space` | `"pixel"` (v2, default) or `"latent"` (v2.1) |
 | `lllite.cond_in_channels` | conditioning1 input channel count (`"3"` standard, `"4"` inpaint) |
 | `lllite.inpaint_masked_input` | `"true"` if RGB was masked before concat at train time (inpaint only) |
 
@@ -615,7 +625,24 @@ python anima_minimal_inference_control_net_lllite.py \
 
 </details>
 
-## 8. Tips & Limitations / 補足と制限
+## 8. Reproducible CUDA Pixel/Latent A/B / 再現可能な CUDA A/B
+
+Do not compare two runs that differ in dataset order, seed, steps, prompts, or sampling cadence. The included runner changes only the conditioning input space and output name:
+
+```bash
+.venv/bin/python tools/dev/run_anima_lllite_cond_ab.py \
+  --config_file configs/my_lllite.toml \
+  --output_root outputs/lllite_cond_ab \
+  --seed 42 \
+  --max_train_steps 500 \
+  -- --sample_prompts prompts.txt --sample_every_n_steps 100
+```
+
+It runs the pixel arm first and latent arm second on CUDA, then writes `ab_manifest.json` with the exact commands and wall times. Compare the training log's steady-state `s/it`, peak VRAM, loss curves, and same-seed sample grids at steps 100/200/… . At least one additional seed is recommended before drawing a quality conclusion. Use `--dry_run` to inspect both commands without launching training.
+
+This repository's automated tests cover construction, VAE tensor conversion, token-grid parity, inpainting mask routing, metadata/save-load separation, and command parity. A real CUDA A/B is deliberately not claimed unless the runner has completed on the target GPU and dataset.
+
+## 9. Tips & Limitations / 補足と制限
 
 * **Resolution alignment.** The conditioning encoder uses fixed stride 16, so `cond_image` HW must equal `latent HW × 8` (i.e. the original training image size) (the latent is patchified with patch size=2, so stride is 8*2=16). The DataLoader for the ControlNet dataset already resizes the conditioning image to match the training image, so in practice you only need to make sure the control image you pass at inference time matches the requested `--image_size`.
 * **`T=1` only.** Video-style multi-frame inputs are not supported — the wrapper asserts `T==1` at forward time.

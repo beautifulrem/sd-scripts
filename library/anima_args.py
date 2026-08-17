@@ -521,6 +521,14 @@ def add_masked_loss_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="apply mask for calculating loss. conditioning_data_dir is required for dataset. / 損失計算時にマスクを適用する。datasetにはconditioning_data_dirが必要",
     )
+    parser.add_argument(
+        "--normalize_alpha_mask_loss",
+        action="store_true",
+        help=(
+            "normalize each sample by its alpha-mask area; opt-in to preserve existing masked-loss semantics "
+            "/ alpha maskの面積でサンプルごとにlossを正規化する（既存の挙動を維持するため既定は無効）"
+        ),
+    )
 
 
 def add_dit_training_arguments(parser: argparse.ArgumentParser):

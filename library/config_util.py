@@ -98,6 +98,7 @@ class ControlNetSubsetParams(BaseSubsetParams):
     conditioning_data_dir: str = None
     caption_extension: str = ".caption"
     cache_info: bool = False
+    alpha_mask: bool = False
 
 
 @dataclass
@@ -234,6 +235,7 @@ class ConfigSanitizer:
     CN_SUBSET_DISTINCT_SCHEMA = {
         Required("image_dir"): str,
         Required("conditioning_data_dir"): str,
+        "alpha_mask": bool,
     }
 
     # datasets schema

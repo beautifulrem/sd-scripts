@@ -66,7 +66,7 @@ class ControlNetDataset(BaseDataset):
                 None,
                 subset.caption_extension,
                 subset.cache_info,
-                False,
+                subset.alpha_mask,
                 subset.num_repeats,
                 subset.shuffle_caption,
                 subset.caption_separator,

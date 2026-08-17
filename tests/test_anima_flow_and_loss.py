@@ -1,9 +1,19 @@
+import argparse
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
-from library import anima_flow_matching, anima_loss, anima_prompt_utils, anima_train_utils
+from library import (
+    anima_args,
+    anima_flow_matching,
+    anima_loss,
+    anima_prompt_utils,
+    anima_train_utils,
+    config_util,
+)
 
 
 def _sampling_args(mode: str) -> SimpleNamespace:
@@ -173,6 +183,72 @@ def test_masked_loss_can_reject_control_image_as_mask_source():
     masked = anima_loss.apply_masked_loss(loss, batch, conditioning_image_is_mask=False)
 
     assert torch.equal(masked, loss)
+
+
+def test_target_alpha_normalization_is_explicit_and_per_sample():
+    loss = torch.ones(2, 1, 2, 2)
+    alpha_masks = torch.tensor(
+        [
+            [[1.0, 1.0], [1.0, 1.0]],
+            [[1.0, 0.0], [0.0, 0.0]],
+        ]
+    )
+
+    unnormalized = anima_loss.apply_masked_loss(loss, {"alpha_masks": alpha_masks})
+    normalized = anima_loss.apply_masked_loss(loss, {"alpha_masks": alpha_masks}, normalize=True)
+
+    torch.testing.assert_close(unnormalized.mean(dim=(1, 2, 3)), torch.tensor([1.0, 0.25]))
+    torch.testing.assert_close(normalized.mean(dim=(1, 2, 3)), torch.ones(2))
+
+
+def test_target_alpha_normalization_keeps_empty_masks_finite():
+    normalized = anima_loss.apply_masked_loss(
+        torch.ones(1, 1, 2, 2),
+        {"alpha_masks": torch.zeros(1, 2, 2)},
+        normalize=True,
+    )
+
+    assert torch.isfinite(normalized).all()
+    assert torch.count_nonzero(normalized) == 0
+
+
+def test_target_alpha_normalization_cli_is_opt_in():
+    parser = argparse.ArgumentParser()
+    anima_args.add_masked_loss_arguments(parser)
+
+    assert parser.parse_args([]).normalize_alpha_mask_loss is False
+    assert parser.parse_args(["--normalize_alpha_mask_loss"]).normalize_alpha_mask_loss is True
+
+
+def test_controlnet_toml_alpha_mask_reaches_dataset_delegate(tmp_path: Path):
+    train_dir = tmp_path / "train"
+    control_dir = tmp_path / "control"
+    train_dir.mkdir()
+    control_dir.mkdir()
+    Image.new("RGBA", (8, 8), color=(100, 120, 140, 128)).save(train_dir / "sample.png")
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(control_dir / "sample.png")
+
+    sanitizer = config_util.ConfigSanitizer(True, True, True, True)
+    blueprint = config_util.BlueprintGenerator(sanitizer).generate(
+        {
+            "datasets": [
+                {
+                    "resolution": [8, 8],
+                    "subsets": [
+                        {
+                            "image_dir": str(train_dir),
+                            "conditioning_data_dir": str(control_dir),
+                            "alpha_mask": True,
+                        }
+                    ],
+                }
+            ]
+        },
+        argparse.Namespace(),
+    )
+    dataset_group, _ = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+
+    assert dataset_group.datasets[0].subsets[0].alpha_mask is True
 
 
 def test_prompt_file_parser_keeps_anima_sampling_fields(tmp_path):

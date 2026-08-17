@@ -48,9 +48,20 @@ num_repeats = 8
 alpha_mask = true
 ```
 
+For Anima ControlNet-LLLite, `conditioning_data_dir` contains the control images and is never interpreted as a loss mask. Use the target image's alpha channel explicitly:
+
+```toml
+[[datasets.subsets]]
+image_dir = "/path/to/rgba/targets"
+conditioning_data_dir = "/path/to/control/images"
+alpha_mask = true
+```
+
+By default, a small mask produces a proportionally smaller sample loss, preserving the historical behavior. Add `--normalize_alpha_mask_loss` to divide each sample by its mean mask coverage after resizing. This makes a face-sized target and a full-image target contribute comparable average loss while retaining relative grayscale weights inside each mask. Empty masks remain zero and finite. The option is explicit and disabled by default.
+
 ## Notes on training
 
-- At the moment, only the dataset in the DreamBooth method is supported.
+- DreamBooth-style and Anima ControlNet-LLLite datasets support target alpha masks. Control images remain control inputs, not masks.
 - The mask is applied after the size is reduced to 1/8, which is the size of the latents. Therefore, fine details (such as ahoge or earrings) may not be learned well. Some dilations of the mask may be necessary.
 - If using masked loss, it may not be necessary to include parts that are not to be trained in the caption. (To be verified)
 - In the case of `alpha_mask`, the latents cache is automatically regenerated when the enable/disable state of the mask is switched.

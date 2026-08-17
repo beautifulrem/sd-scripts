@@ -205,6 +205,8 @@ resize_interpolation = "lanczos"
 
 - 支持 alpha mask。
 - 当 batch 同时包含 `alpha_masks` 和 ControlNet/EasyControl 条件图时，优先使用显式 alpha mask。
+- `--normalize_alpha_mask_loss` 是显式可选开关：按每个样本的 alpha mask 平均覆盖率归一化，使不同 mask 面积的样本具有可比的 loss 尺度；默认关闭以保持旧训练语义。
+- ControlNet-LLLite 数据集支持在 TOML subset 中设置 `alpha_mask = true`，并把目标图 alpha 沿配置、dataset、batch 链路传入 loss；`conditioning_data_dir` 始终是控制图，不会被误当作 mask。
 - 只在没有 alpha mask 且调用者声明条件图就是 mask 时，才将 `conditioning_images[:, 0]` 当作 mask。
 - mask 会用 area interpolation 缩放到 latent loss 尺寸。
 
@@ -265,6 +267,7 @@ resize_interpolation = "lanczos"
 ### 7.5 其他保留优化
 
 - `--qwen_image_vae_2d`：单图 Qwen-Image 2D VAE 路径，适合 latent cache。
+- Qwen VAE spatial chunking 使用标准 Conv2d 输出尺寸公式，修复 Free-fit Bucket 长图/高分辨率下 stride-2、无 padding 的确定性尺寸崩溃；chunked 与普通 Conv2d 有数值对照回归测试。
 - `--cuda_allow_tf32`。
 - `--cuda_cudnn_benchmark`。
 - gradient checkpointing、block swap、CPU/Unsloth activation offload。
@@ -477,6 +480,7 @@ EasyControl：
 ### 14.2 Anima 模型配置自动推断
 
 - 根据 state dict 形状推断 hidden size、block 数、head 和 adapter 配置。
+- 支持连续任意 block 数以及编号 safetensors 分片；已覆盖 40-block Anima 2.9B Preview 和最多 38 blocks swap，不引入 28/40 特判。
 - 支持 ComfyUI `net.` 前缀。
 - 加强 Anima Aesthetic/alternate weight key 归一化。
 - 对不完整或形状不一致的权重提前报错，避免后续 AttributeError。
@@ -561,6 +565,8 @@ T-LoRA、Chimera、Turbo-DMD 和 EasyControl 的 forward 依赖当前 batch/step
 - 保留 Anima ControlNet-LLLite 训练和独立推理。
 - 支持 Qwen-Image 2D VAE、独立 LLM Adapter 权重和多 LoRA。
 - LLLite 权重 metadata 可推断 `cond_emb_dim`、`mlp_dim`、`target_layers`、`cond_dim`、`cond_resblocks`，也可 CLI 覆盖。
+- `--lllite_cond_input=pixel|latent` 隔离 v2 pixel 与 v2.1 Qwen-VAE latent stem；pixel 默认不变，metadata 保存输入空间，错载权重会拒绝。semantic trunk 未引入。
+- `tools/dev/run_anima_lllite_cond_ab.py` 用相同 config、数据、seed 和 steps 生成 CUDA A/B；真实速度和效果需在目标 GPU 上验证。
 - prompt 文件支持每条 `--cn` 条件图与 `--am` multiplier 覆盖。
 - masked loss 优先显式 alpha mask，不再将普通条件图静默当作 mask。
 
@@ -641,4 +647,3 @@ T-LoRA、Chimera、Turbo-DMD 和 EasyControl 的 forward 依赖当前 batch/step
 - [Validation](validation.md)
 - [Masked loss](masked_loss_README.md)
 - [ControlNet-LLLite](anima_train_control_net_lllite.md)
-

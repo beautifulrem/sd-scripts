@@ -23,6 +23,10 @@ LLM_ADAPTER_NAME = "llm_adapter"
 # state_dict メタデータに記録するアーキテクチャ世代
 LLLITE_ARCH_VERSION = "2"
 
+# Optional v2.1 input space. Missing metadata always means the legacy pixel path.
+COND_INPUT_SPACES: Tuple[str, ...] = ("pixel", "latent")
+LATENT_COND_CHANNELS = 16
+
 
 # ----------------------------------------------------------------------------
 # target_layers: atomic specifiers と preset
@@ -144,10 +148,16 @@ class _ASPP(nn.Module):
 class _Conditioning1(nn.Module):
     """v2 conditioning trunk.
 
-    in (B,C_in,H,W)
+    pixel: in (B,C_in,H,W)
       -> Conv 4x4 s=4    + GN + SiLU      # cond_dim/2,  H/4
       -> Conv 3x3 s=1    + GN + SiLU      # cond_dim/2,  H/4   (受容野拡張)
       -> Conv 4x4 s=4    + GN + SiLU      # cond_dim,    H/16  (token 解像度)
+
+    latent: in (B,16,H/8,W/8)
+      -> Conv 3x3 s=1 + GN + SiLU
+      -> Conv 2x2 s=2 + GN + SiLU         # token 解像度
+
+    common:
       -> ResBlock x N                     # cond_dim,    H/16
       -> Conv 1x1                         # cond_emb_dim
       -> flatten (B, S, cond_emb_dim)
@@ -164,19 +174,41 @@ class _Conditioning1(nn.Module):
         use_aspp: bool = False,
         aspp_dilations: Tuple[int, ...] = ASPP_DEFAULT_DILATIONS,
         cond_in_channels: int = 3,
+        input_space: str = "pixel",
     ):
         super().__init__()
         assert cond_dim % 2 == 0, f"cond_dim must be even, got {cond_dim}"
         assert cond_in_channels >= 1, f"cond_in_channels must be >= 1, got {cond_in_channels}"
+        assert input_space in COND_INPUT_SPACES, (
+            f"input_space must be one of {list(COND_INPUT_SPACES)}, got {input_space!r}"
+        )
+        if input_space == "latent":
+            assert cond_in_channels in (3, 4), (
+                f"latent input space supports cond_in_channels 3 or 4, got {cond_in_channels}"
+            )
         ch_half = cond_dim // 2
 
         self.cond_in_channels = cond_in_channels
-        self.conv1 = nn.Conv2d(cond_in_channels, ch_half, kernel_size=4, stride=4, padding=0)
-        self.norm1 = _gn(ch_half)
-        self.conv2 = nn.Conv2d(ch_half, ch_half, kernel_size=3, stride=1, padding=1)
-        self.norm2 = _gn(ch_half)
-        self.conv3 = nn.Conv2d(ch_half, cond_dim, kernel_size=4, stride=4, padding=0)
-        self.norm3 = _gn(cond_dim)
+        self.input_space = input_space
+        self.use_mask_branch = input_space == "latent" and cond_in_channels == 4
+
+        if input_space == "pixel":
+            self.conv1 = nn.Conv2d(cond_in_channels, ch_half, kernel_size=4, stride=4, padding=0)
+            self.norm1 = _gn(ch_half)
+            self.conv2 = nn.Conv2d(ch_half, ch_half, kernel_size=3, stride=1, padding=1)
+            self.norm2 = _gn(ch_half)
+            self.conv3 = nn.Conv2d(ch_half, cond_dim, kernel_size=4, stride=4, padding=0)
+            self.norm3 = _gn(cond_dim)
+        else:
+            if self.use_mask_branch:
+                self.mask_conv1 = nn.Conv2d(1, 4, kernel_size=2, stride=2, padding=0)
+                self.mask_conv2 = nn.Conv2d(4, 8, kernel_size=3, stride=2, padding=1)
+                self.mask_conv3 = nn.Conv2d(8, LATENT_COND_CHANNELS, kernel_size=3, stride=2, padding=1)
+            stem_in = LATENT_COND_CHANNELS * (2 if self.use_mask_branch else 1)
+            self.lat_conv1 = nn.Conv2d(stem_in, cond_dim, kernel_size=3, stride=1, padding=1)
+            self.lat_norm1 = _gn(cond_dim)
+            self.lat_conv2 = nn.Conv2d(cond_dim, cond_dim, kernel_size=2, stride=2, padding=0)
+            self.lat_norm2 = _gn(cond_dim)
 
         self.resblocks = nn.ModuleList([_ResBlock(cond_dim) for _ in range(n_resblocks)])
 
@@ -186,10 +218,26 @@ class _Conditioning1(nn.Module):
         self.proj = nn.Conv2d(cond_dim, cond_emb_dim, kernel_size=1)
         self.out_norm = nn.LayerNorm(cond_emb_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.norm1(self.conv1(x)))
-        h = F.silu(self.norm2(self.conv2(h)))
-        h = F.silu(self.norm3(self.conv3(h)))
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.input_space == "pixel":
+            assert mask is None, "pixel input space packs any mask into the fourth image channel"
+            h = F.silu(self.norm1(self.conv1(x)))
+            h = F.silu(self.norm2(self.conv2(h)))
+            h = F.silu(self.norm3(self.conv3(h)))
+        else:
+            if self.use_mask_branch:
+                assert mask is not None, "latent inpainting mode requires a mask tensor"
+                m = F.silu(self.mask_conv1(mask))
+                m = F.silu(self.mask_conv2(m))
+                m = self.mask_conv3(m)
+                assert m.shape[-2:] == x.shape[-2:], (
+                    f"mask pyramid output {tuple(m.shape[-2:])} does not match cond latent {tuple(x.shape[-2:])}"
+                )
+                x = torch.cat([x, m], dim=1)
+            else:
+                assert mask is None, "cond_mask requires latent inpainting mode (cond_in_channels=4)"
+            h = F.silu(self.lat_norm1(self.lat_conv1(x)))
+            h = F.silu(self.lat_norm2(self.lat_conv2(h)))
         for rb in self.resblocks:
             h = rb(h)
         if self.aspp is not None:
@@ -326,10 +374,14 @@ class ControlNetLLLiteDiT(nn.Module):
         aspp_dilations: Tuple[int, ...] = ASPP_DEFAULT_DILATIONS,
         cond_in_channels: int = 3,
         inpaint_masked_input: bool = False,
+        cond_input_space: str = "pixel",
     ):
         super().__init__()
 
         atomics = parse_target_layers(target_layers)
+        assert cond_input_space in COND_INPUT_SPACES, (
+            f"cond_input_space must be one of {list(COND_INPUT_SPACES)}, got {cond_input_space!r}"
+        )
 
         self.cond_emb_dim = cond_emb_dim
         self.mlp_dim = mlp_dim
@@ -345,12 +397,14 @@ class ControlNetLLLiteDiT(nn.Module):
         # 記録するためのフラグで、モデル forward の挙動には影響しない (メタデータ復元用)。
         self.cond_in_channels = cond_in_channels
         self.inpaint_masked_input = inpaint_masked_input
+        self.cond_input_space = cond_input_space
 
         # cond image (B, cond_in_channels, H*16, W*16) -> (B, S, cond_emb_dim)
         self.conditioning1 = _Conditioning1(
             cond_dim, cond_emb_dim, cond_resblocks,
             use_aspp=use_aspp, aspp_dilations=aspp_dilations,
             cond_in_channels=cond_in_channels,
+            input_space=cond_input_space,
         )
 
         modules = self._create_modules(dit, cond_emb_dim, mlp_dim, atomics, dropout, multiplier)
@@ -369,6 +423,7 @@ class ControlNetLLLiteDiT(nn.Module):
         logger.info(
             f"ControlNet-LLLite (Anima v{LLLITE_ARCH_VERSION}): created {n} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), "
+            f"cond_input={cond_input_space}, "
             f"cond_in_channels={cond_in_channels}, cond_dim={cond_dim}, cond_resblocks={cond_resblocks}, {aspp_info}, "
             f"cond_emb_dim={cond_emb_dim}, mlp_dim={mlp_dim}{inpaint_info}"
         )
@@ -440,14 +495,14 @@ class ControlNetLLLiteDiT(nn.Module):
 
         return modules
 
-    def set_cond_image(self, cond_image: Optional[torch.Tensor]):
-        """cond_image: (B, 3, H*16, W*16). None で解除."""
+    def set_cond_image(self, cond_image: Optional[torch.Tensor], cond_mask: Optional[torch.Tensor] = None):
+        """Encode a pixel or VAE-latent control tensor. ``None`` clears conditioning."""
         if cond_image is None:
             for m in self.lllite_modules:
                 m.cond_emb = None
                 m.depth_emb = None
             return
-        cx = self.conditioning1(cond_image)  # (B, S, cond_emb_dim)
+        cx = self.conditioning1(cond_image, cond_mask)  # (B, S, cond_emb_dim)
         for m in self.lllite_modules:
             # 共有の cx を全モジュールに同一テンソルとして持たせ (N コピーを避ける)、
             # depth embedding はこのモジュール用の (cond_emb_dim,) スライスだけを渡す。
@@ -489,28 +544,72 @@ class AnimaControlNetLLLiteWrapper(nn.Module):
         timesteps: torch.Tensor,
         context: torch.Tensor,
         cond_image: Optional[torch.Tensor] = None,
+        cond_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # T=1 固定
         assert x.shape[2] == 1, f"Anima LLLite supports T=1 only, got T={x.shape[2]}"
         if cond_image is not None:
-            # 解像度整合チェック: x は VAE latent (/8)、cond_image は元画像 (/1)。
-            # patchify (/2) は DiT 内部 (prepare_embedded_sequence) で実施されるため、
-            # ここでは latent HW * 8 == cond_image HW を期待する。
-            # conditioning1 (stride 16) は cond_image を /16 = latent/2 = token 空間に揃える。
-            expected_h = x.shape[-2] * 8
-            expected_w = x.shape[-1] * 8
-            assert cond_image.shape[-2] == expected_h and cond_image.shape[-1] == expected_w, (
-                f"cond_image HW mismatch: latent={x.shape[-2]}x{x.shape[-1]} -> expected "
-                f"{expected_h}x{expected_w}, got {cond_image.shape[-2]}x{cond_image.shape[-1]}"
-            )
-            expected_c = self.lllite.cond_in_channels
-            assert cond_image.shape[1] == expected_c, (
-                f"cond_image channel mismatch: expected {expected_c} (cond_in_channels), "
-                f"got {cond_image.shape[1]}"
-            )
-            self.lllite.set_cond_image(cond_image)
+            latent_h, latent_w = x.shape[-2:]
+            if self.lllite.cond_input_space == "pixel":
+                expected_h, expected_w = latent_h * 8, latent_w * 8
+                assert cond_image.shape[-2:] == (expected_h, expected_w), (
+                    f"cond_image HW mismatch: expected {expected_h}x{expected_w}, got {tuple(cond_image.shape[-2:])}"
+                )
+                assert cond_image.shape[1] == self.lllite.cond_in_channels, (
+                    f"cond_image channel mismatch: expected {self.lllite.cond_in_channels}, got {cond_image.shape[1]}"
+                )
+                assert cond_mask is None, "pixel mode packs any mask into cond_image"
+            else:
+                assert cond_image.shape[-2:] == (latent_h, latent_w), (
+                    f"cond latent HW mismatch: expected {latent_h}x{latent_w}, got {tuple(cond_image.shape[-2:])}"
+                )
+                assert cond_image.shape[1] == LATENT_COND_CHANNELS, (
+                    f"cond latent channel mismatch: expected {LATENT_COND_CHANNELS}, got {cond_image.shape[1]}"
+                )
+                if self.lllite.cond_in_channels == 4:
+                    expected_mask_shape = (cond_image.shape[0], 1, latent_h * 8, latent_w * 8)
+                    assert cond_mask is not None and tuple(cond_mask.shape) == expected_mask_shape, (
+                        f"cond_mask shape mismatch: expected {expected_mask_shape}, "
+                        f"got {None if cond_mask is None else tuple(cond_mask.shape)}"
+                    )
+                else:
+                    assert cond_mask is None, "cond_mask requires cond_in_channels=4"
+            self.lllite.set_cond_image(cond_image, cond_mask)
         return self.dit(x, timesteps, context, **kwargs)
+
+
+def build_cond_tensors(
+    rgb: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    *,
+    cond_input_space: str = "pixel",
+    cond_in_channels: int = 3,
+    inpaint_masked_input: bool = False,
+    vae=None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build the control tensors shared by training, sampling, and inference."""
+    assert cond_input_space in COND_INPUT_SPACES, (
+        f"cond_input_space must be one of {list(COND_INPUT_SPACES)}, got {cond_input_space!r}"
+    )
+    is_inpaint = cond_in_channels == 4
+    if is_inpaint:
+        assert mask is not None, "mask is required when cond_in_channels=4"
+    elif mask is not None:
+        raise ValueError(f"mask given but cond_in_channels={cond_in_channels} (expected 4)")
+
+    if is_inpaint and inpaint_masked_input:
+        rgb = rgb * (mask < 0.5).to(rgb.dtype)
+    mask_pm1 = mask.to(rgb.dtype) * 2.0 - 1.0 if is_inpaint else None
+
+    if cond_input_space == "pixel":
+        return (torch.cat([rgb, mask_pm1], dim=1) if is_inpaint else rgb), None
+
+    assert vae is not None, "vae is required for cond_input_space='latent'"
+    with torch.no_grad(), torch.autocast(device_type=rgb.device.type, enabled=False):
+        cond_latent = vae.encode_pixels_to_latents(rgb.to(device=vae.device, dtype=vae.dtype))
+    cond_latent = cond_latent.to(device=rgb.device, dtype=rgb.dtype)
+    return cond_latent, mask_pm1
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +739,17 @@ def load_lllite_weights(lllite: ControlNetLLLiteDiT, file: str, strict: bool = F
             f"(keys starting with '{_INTERNAL_MODULES_PREFIX}'). The current code uses a "
             f"named-key format (per-module key prefix = lllite_name, e.g. "
             f"'lllite_dit_blocks_0_self_attn_q_proj.down.weight'). Re-train with the current codebase."
+        )
+
+    file_space = None
+    if any(k.startswith(_SAVED_COND_PREFIX + "lat_conv1.") for k in weights_sd):
+        file_space = "latent"
+    elif any(k.startswith(_SAVED_COND_PREFIX + "conv1.") for k in weights_sd):
+        file_space = "pixel"
+    if file_space is not None and file_space != lllite.cond_input_space:
+        raise RuntimeError(
+            f"cond input space mismatch: weights at {file} use '{file_space}', but the LLLite "
+            f"was built with '{lllite.cond_input_space}'. Check --lllite_cond_input and checkpoint metadata."
         )
 
     converted = _from_saved_state_dict(lllite, weights_sd)

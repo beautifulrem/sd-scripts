@@ -52,7 +52,9 @@ from networks.control_net_lllite_anima import (
     AnimaControlNetLLLiteWrapper,
     save_lllite_model,
     load_lllite_weights,
+    build_cond_tensors,
     LLLITE_ARCH_VERSION,
+    COND_INPUT_SPACES as LLLITE_COND_INPUT_SPACES,
     PRESETS as LLLITE_PRESETS,
     ATOMIC_SPECIFIERS as LLLITE_ATOMIC_SPECIFIERS,
 )
@@ -83,24 +85,6 @@ def _load_mask_image(path: str, width: int, height: int, device, dtype) -> torch
     return tensor.to(device=device, dtype=dtype)
 
 
-def _build_inpaint_cond_image(
-    rgb: torch.Tensor,
-    masks: torch.Tensor,
-    masked_input: bool,
-) -> torch.Tensor:
-    """rgb: (B, 3, H, W) in [-1, 1], masks: (B, 1, H, W) in {0, 1} (1=inpaint).
-    Returns (B, 4, H, W) with the mask channel normalized to [-1, 1] to match the RGB range.
-
-    masked_input=True のとき、RGB を mask 域で 0 に潰してから concat する。
-    """
-    if masked_input:
-        keep = (masks < 0.5).to(rgb.dtype)  # (B, 1, H, W)
-        rgb = rgb * keep
-    # mask channel: {0, 1} -> {-1, 1} (= (mask - 0.5) * 2). matches transforms.Normalize([0.5], [0.5])
-    mask_pm1 = masks.to(rgb.dtype) * 2.0 - 1.0
-    return torch.cat([rgb, mask_pm1], dim=1)
-
-
 def _generate_random_masks_for_batch(
     batch_size: int, height: int, width: int, device, dtype
 ) -> torch.Tensor:
@@ -115,7 +99,7 @@ def _generate_random_masks_for_batch(
     return torch.from_numpy(masks_np).to(device=device, dtype=dtype)
 
 
-def _make_lllite_sample_hooks(args, lllite, dit_dtype):
+def _make_lllite_sample_hooks(args, lllite, dit_dtype, vae=None):
     """Build (on_prompt_start, on_prompt_end) callbacks that wire control image / multiplier
     into the LLLite module before each sample prompt is rendered. The pre-sample multiplier is
     saved and restored so that, e.g., `--am 0` for inspection does not leak into training (which
@@ -128,6 +112,8 @@ def _make_lllite_sample_hooks(args, lllite, dit_dtype):
     """
 
     is_inpaint = lllite.cond_in_channels == 4
+    is_latent = lllite.cond_input_space == "latent"
+    assert not is_latent or vae is not None, "vae is required for latent cond input space"
 
     saved = {"multiplier": None}
 
@@ -179,11 +165,18 @@ def _make_lllite_sample_hooks(args, lllite, dit_dtype):
                 lllite.clear_cond_image()
                 return
             mask = _load_mask_image(mk_path, w, h, accelerator.device, dit_dtype)
-            cond_image = _build_inpaint_cond_image(rgb, mask, args.lllite_inpaint_masked_input)
         else:
-            cond_image = rgb
+            mask = None
 
-        lllite.set_cond_image(cond_image)
+        cond_image, cond_mask = build_cond_tensors(
+            rgb,
+            mask,
+            cond_input_space=lllite.cond_input_space,
+            cond_in_channels=lllite.cond_in_channels,
+            inpaint_masked_input=args.lllite_inpaint_masked_input,
+            vae=vae,
+        )
+        lllite.set_cond_image(cond_image, cond_mask)
 
     def on_prompt_end(prompt_dict: dict):
         lllite.clear_cond_image()
@@ -272,6 +265,16 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
             "/ inpainting 時、RGB の mask 域を 0 で穴埋めしてから concat する (cond_in_channels=4 のときのみ有効)"
         ),
     )
+    parser.add_argument(
+        "--lllite_cond_input",
+        type=str,
+        default="pixel",
+        choices=list(LLLITE_COND_INPUT_SPACES),
+        help=(
+            "control input space: pixel keeps the v2 path (default); latent VAE-encodes the control image "
+            "before the v2.1 stem / 制御入力空間。pixel は従来互換、latent は VAE latent を入力"
+        ),
+    )
     # --conditioning_data_dir は args_util.add_dataset_arguments 側で既に定義済み
 
 
@@ -317,6 +320,7 @@ def train(args):
         )
 
     cache_latents = args.cache_latents
+    is_latent_cond = args.lllite_cond_input == "latent"
 
     if args.seed is not None:
         set_seed(args.seed)
@@ -463,9 +467,14 @@ def train(args):
         vae.requires_grad_(False)
         vae.eval()
         train_dataset_group.new_cache_latents(vae, accelerator)
-        vae.to("cpu")
+        if not is_latent_cond:
+            vae.to("cpu")
         clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
+    elif is_latent_cond:
+        vae.to(accelerator.device, dtype=weight_dtype)
+        vae.requires_grad_(False)
+        vae.eval()
 
     # DiT (frozen)
     logger.info("Loading Anima DiT...")
@@ -490,6 +499,11 @@ def train(args):
     # inpainting (4ch) フラグの早期検証
     if args.lllite_cond_in_channels < 1:
         raise ValueError(f"--lllite_cond_in_channels must be >= 1, got {args.lllite_cond_in_channels}")
+    if is_latent_cond and args.lllite_cond_in_channels not in (3, 4):
+        raise ValueError(
+            "--lllite_cond_input latent supports --lllite_cond_in_channels 3 or 4, "
+            f"got {args.lllite_cond_in_channels}"
+        )
     if args.lllite_inpaint_masked_input and args.lllite_cond_in_channels != 4:
         logger.warning(
             f"--lllite_inpaint_masked_input is only effective when --lllite_cond_in_channels=4 "
@@ -511,6 +525,7 @@ def train(args):
         use_aspp=args.lllite_use_aspp,
         cond_in_channels=args.lllite_cond_in_channels,
         inpaint_masked_input=args.lllite_inpaint_masked_input,
+        cond_input_space=args.lllite_cond_input,
     )
 
     if args.network_weights is not None:
@@ -641,7 +656,7 @@ def train(args):
 
     # sample image hooks: inject control image / multiplier into LLLite around each prompt
     on_prompt_start, on_prompt_end = _make_lllite_sample_hooks(
-        args, accelerator.unwrap_model(wrapper).lllite, dit_weight_dtype
+        args, accelerator.unwrap_model(wrapper).lllite, dit_weight_dtype, vae
     )
 
     def _sample_images(epoch_arg, step_arg):
@@ -681,6 +696,7 @@ def train(args):
         sai_metadata["lllite.use_aspp"] = "true" if args.lllite_use_aspp else "false"
         if args.lllite_use_aspp:
             sai_metadata["lllite.aspp_dilations"] = ",".join(str(d) for d in unwrapped.aspp_dilations)
+        sai_metadata["lllite.cond_input_space"] = args.lllite_cond_input
         sai_metadata["lllite.cond_in_channels"] = str(args.lllite_cond_in_channels)
         sai_metadata["lllite.inpaint_masked_input"] = (
             "true" if args.lllite_inpaint_masked_input else "false"
@@ -788,17 +804,25 @@ def train(args):
                 padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
 
                 # cond image: dataset 側で IMAGE_TRANSFORMS により [-1,1] 正規化済み
-                cond_image = batch["conditioning_images"].to(accelerator.device, dtype=dit_weight_dtype)
+                cond_rgb = batch["conditioning_images"].to(accelerator.device, dtype=dit_weight_dtype)
 
-                # inpainting: ランダム mask をバッチ毎に生成し、cond_image を 4ch (RGB + mask) 化
+                # inpainting: generate one mask per sample; build_cond_tensors routes it for pixel/latent stems
                 if is_inpaint:
-                    bs_c, _, h_c, w_c = cond_image.shape
+                    bs_c, _, h_c, w_c = cond_rgb.shape
                     mask = _generate_random_masks_for_batch(
                         bs_c, h_c, w_c, accelerator.device, dit_weight_dtype
                     )
-                    cond_image = _build_inpaint_cond_image(
-                        cond_image, mask, args.lllite_inpaint_masked_input
-                    )
+                else:
+                    mask = None
+
+                cond_image, cond_mask = build_cond_tensors(
+                    cond_rgb,
+                    mask,
+                    cond_input_space=args.lllite_cond_input,
+                    cond_in_channels=args.lllite_cond_in_channels,
+                    inpaint_masked_input=args.lllite_inpaint_masked_input,
+                    vae=vae,
+                )
 
                 # 5D化
                 noisy_model_input = noisy_model_input.unsqueeze(2)  # (B, C, 1, H, W)
@@ -809,6 +833,7 @@ def train(args):
                         timesteps,
                         prompt_embeds,
                         cond_image=cond_image,
+                        cond_mask=cond_mask,
                         padding_mask=padding_mask,
                         source_attention_mask=attn_mask,
                         t5_input_ids=t5_input_ids,
@@ -829,7 +854,12 @@ def train(args):
                             "ControlNet-LLLite conditioning images are control inputs, not loss masks; "
                             "enable alpha_mask on the training images when using --masked_loss"
                         )
-                    loss = apply_masked_loss(loss, batch, conditioning_image_is_mask=False)
+                    loss = apply_masked_loss(
+                        loss,
+                        batch,
+                        conditioning_image_is_mask=False,
+                        normalize=args.normalize_alpha_mask_loss,
+                    )
                 loss = loss_util.reduce_weighted_loss(loss, weighting, batch["loss_weights"]).mean()
 
                 try:

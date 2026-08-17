@@ -209,10 +209,10 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
 #### Memory and Speed / メモリ・速度関連
 
 * `--blocks_to_swap=<integer>`
-  - Number of Transformer blocks to swap between CPU and GPU. More blocks reduce VRAM but slow training. Maximum values depend on model size:
-    - 28-block model: max **26** (Anima-Preview)
-    - 36-block model: max **34**
-    - 20-block model: max **18**
+  - Number of Transformer blocks to swap between CPU and GPU. More blocks reduce VRAM but slow training. The loader infers the checkpoint's contiguous block count; the maximum is always `num_blocks - 2`:
+    - 28-block model: max **26**
+    - 40-block Anima 2.9B Preview: max **38**
+    - Any other compatible checkpoint: inferred block count minus **2**
   - Cannot be used with `--cpu_offload_checkpointing` or `--unsloth_offload_checkpointing`.
 * `--unsloth_offload_checkpointing`
   - Offload activations to CPU RAM using async non-blocking transfers (faster than `--cpu_offload_checkpointing`). Cannot be combined with `--cpu_offload_checkpointing` or `--blocks_to_swap`.
@@ -228,6 +228,20 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Disable internal caching in Qwen-Image VAE to reduce VRAM usage.
 * `--compile` and related options
   - Speed up training with per-block `torch.compile`. See the [torch.compile for Anima guide](anima_torch_compile.md) for details.
+
+#### Expanded 40-block checkpoints / 40-block 拡張チェックポイント
+
+The `remi` loader does not hard-code a 28/40-block model table. It reads every safetensors shard, requires a contiguous `blocks.0 ... blocks.N` set, and infers the block count, model width, attention heads, MLP ratio, patch size, and text-conditioning width from tensor shapes. Both a single `.safetensors` file and numbered shards such as `model-00001-of-00002.safetensors` are supported; pass the first shard as `--pretrained_model_name_or_path`.
+
+An opt-in smoke test is provided for a locally downloaded real 2.9B checkpoint:
+
+```bash
+ANIMA_29B_CHECKPOINT=/path/to/Anima-2.9B-preview-v1.safetensors \
+  .venv/bin/python -m pytest -q \
+  tests/test_anima_model_and_adapters.py -k real_expanded
+```
+
+The public [`Gazingstars123/Anima-2.9B`](https://huggingface.co/Gazingstars123/Anima-2.9B) Preview v1 header (commit `fb00923`) was checked on 2026-08-17: 928 tensors, contiguous blocks `0..39`, inferred width `2048`, 16 attention heads, and MLP ratio `4.0`. This confirms structural loading compatibility; it is not a substitute for a CUDA forward/backward smoke test on the GPU and precision you intend to train with.
 * `--qwen_image_vae_2d`
   - Use the image-only 2D Qwen-Image VAE. The official (3D causal Conv3d) VAE weights are converted to equivalent 2D convolutions on load, so no separate weight file is needed and, for single images, the latents are numerically equivalent to the default 3D VAE. This is roughly 2x faster and uses about 1/3 of the peak VRAM for encode/decode (e.g., about 4.4 GB / 7.7 s -> about 1.4 GB / 4.5 s for 10 images at 1024x1024 on an RTX 3090). Recommended for latent caching. Note: with the 2D VAE the peak memory is dominated by full-resolution activations and the mid-block attention, so `--vae_chunk_size` has little further effect on the peak, and `--vae_disable_cache` is a no-op (the 2D VAE has no temporal cache).
 

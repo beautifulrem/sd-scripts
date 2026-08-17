@@ -1,4 +1,5 @@
 import contextlib
+import os
 import sys
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ from networks import (
 )
 
 
-def _tiny_anima() -> Anima:
+def _tiny_anima(num_blocks: int = 1) -> Anima:
     return Anima(
         max_img_h=8,
         max_img_w=8,
@@ -33,7 +34,7 @@ def _tiny_anima() -> Anima:
         patch_temporal=1,
         concat_padding_mask=False,
         model_channels=64,
-        num_blocks=1,
+        num_blocks=num_blocks,
         num_heads=4,
         mlp_ratio=2.0,
         crossattn_emb_channels=32,
@@ -66,6 +67,64 @@ def test_anima_checkpoint_shape_inference_supports_non_base_architecture():
     assert config["concat_padding_mask"] is False
     assert config["adaln_lora_dim"] == 8
     assert config["use_llm_adapter"] is False
+
+
+def test_anima_checkpoint_shape_inference_supports_expanded_40_block_architecture():
+    shapes = {key: tuple(value.shape) for key, value in _tiny_anima().state_dict().items()}
+    block_zero = {key: shape for key, shape in shapes.items() if key.startswith("blocks.0.")}
+    for block_index in range(1, 40):
+        for key, shape in block_zero.items():
+            shapes[key.replace("blocks.0.", f"blocks.{block_index}.", 1)] = shape
+
+    config = anima_utils._infer_anima_dit_config_from_shapes(shapes)
+
+    assert config["num_blocks"] == 40
+    assert config["model_channels"] == 64
+    assert config["num_heads"] == 4
+
+
+def test_anima_loader_reads_all_shards_for_expanded_40_block_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    source = _tiny_anima(num_blocks=40)
+    state = {key: value.contiguous() for key, value in source.state_dict().items()}
+    first = {key: value for key, value in state.items() if not key.startswith("blocks.") or int(key.split(".")[1]) < 20}
+    second = {key: value for key, value in state.items() if key.startswith("blocks.") and int(key.split(".")[1]) >= 20}
+    first_path = tmp_path / "tiny_anima-00001-of-00002.safetensors"
+    second_path = tmp_path / "tiny_anima-00002-of-00002.safetensors"
+    save_file(first, str(first_path))
+    save_file(second, str(second_path))
+    del source, state, first, second
+
+    restored = anima_utils.load_anima_model("cpu", str(first_path), "torch", False, "cpu", torch.float32)
+
+    assert restored.num_blocks == 40
+    assert len(restored.blocks) == 40
+
+
+def test_expanded_40_block_model_accepts_maximum_block_swap():
+    model = _tiny_anima(num_blocks=40)
+
+    model.enable_block_swap(38, torch.device("cpu"))
+    model.prepare_block_swap_before_forward()
+
+    assert model.blocks_to_swap == 38
+    assert model.offloader.num_blocks == 40
+    with pytest.raises(AssertionError, match="Cannot swap more than 38 blocks"):
+        model.enable_block_swap(39, torch.device("cpu"))
+
+
+@pytest.mark.skipif(not os.getenv("ANIMA_29B_CHECKPOINT"), reason="ANIMA_29B_CHECKPOINT is not configured")
+def test_real_expanded_anima_checkpoint_load_smoke():
+    checkpoint = os.environ["ANIMA_29B_CHECKPOINT"]
+
+    restored = anima_utils.load_anima_model("cpu", checkpoint, "torch", False, "cpu", torch.bfloat16)
+    restored.requires_grad_(False)
+    network = lora_anima.create_network(1.0, 2, 2.0, None, [], restored)
+
+    assert restored.num_blocks == 40
+    assert len(restored.blocks) == 40
+    assert any("blocks_39_" in module.lora_name for module in network.unet_loras)
 
 
 def test_anima_loader_roundtrips_inferred_non_base_architecture(tmp_path):
